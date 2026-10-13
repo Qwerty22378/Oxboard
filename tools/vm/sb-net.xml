@@ -1,0 +1,13 @@
+<!-- NAT network for the driver test VMs. Fixed IPs so KDNET's hostip never changes. -->
+<network>
+  <name>sb-net</name>
+  <forward mode='nat'/>
+  <bridge name='virbr-sb' stp='on' delay='0'/>
+  <ip address='192.168.150.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.150.100' end='192.168.150.200'/>
+      <host mac='52:54:00:5b:00:10' name='sb-build'  ip='192.168.150.10'/>
+      <host mac='52:54:00:5b:00:20' name='sb-target' ip='192.168.150.20'/>
+    </dhcp>
+  </ip>
+</network>

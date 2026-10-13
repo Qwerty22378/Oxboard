@@ -1,0 +1,16 @@
+# Used by the tools/vm scripts via `ssh -F`. To use it by hand too, add to ~/.ssh/config:
+#   Include ~/Desktop/Projects/Soundboard/tools/vm/ssh_config
+Host sb-build
+    HostName 192.168.150.10
+
+Host sb-target
+    HostName 192.168.150.20
+
+Host sb-build sb-target
+    User dev
+    IdentityFile ~/Desktop/Projects/Soundboard/tools/vm/.state/id_ed25519
+    IdentitiesOnly yes
+    # VMs get rebuilt and reverted, so keep their host keys out of ~/.ssh/known_hosts.
+    UserKnownHostsFile ~/Desktop/Projects/Soundboard/tools/vm/.state/known_hosts
+    StrictHostKeyChecking accept-new
+    ServerAliveInterval 30
