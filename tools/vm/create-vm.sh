@@ -62,6 +62,11 @@ fi
 rm -f "$DISK"
 ssh-keygen -q -R "${VM_IP[$ROLE]}" -f "$STATE_DIR/known_hosts" &>/dev/null || true  # new install, new host key
 
+# sb-build runs the engine's WASAPI tests: two sound cards give two independently clocked
+# outputs (HDA "Speakers" + USB "Speakers (Audio Device)") and a capture device, for drift tests.
+EXTRA=()
+[[ $ROLE == build ]] && EXTRA+=(--sound model=ich9 --sound model=usb)
+
 info "Creating $NAME: ${VM_VCPUS[$ROLE]} vCPU, $((VM_RAM[$ROLE] / 1024)) GiB RAM, ${VM_DISK[$ROLE]} GiB disk, ${VM_NIC[$ROLE]} NIC"
 virt-install \
   --name "$NAME" --osinfo win11 \
@@ -76,6 +81,7 @@ virt-install \
   --network network="$NET_NAME",model="${VM_NIC[$ROLE]}",mac="${VM_MAC[$ROLE]}" \
   --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0 \
   --graphics spice --video qxl \
+  "${EXTRA[@]}" \
   --install no_install=yes \
   --noautoconsole
 

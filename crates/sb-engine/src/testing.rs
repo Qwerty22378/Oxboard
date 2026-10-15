@@ -91,11 +91,12 @@ impl FakeEndpoints {
     }
 }
 
-/// Records the master bus; one block per call.
+/// Records the master bus; one block per call. `now` is whatever the test sets.
 #[derive(Default)]
 pub struct FakeClock {
     pub out: Vec<Frame>,
     pub masters: Vec<Option<String>>,
+    pub now: u64,
 }
 
 impl MasterClock for FakeClock {
@@ -107,6 +108,9 @@ impl MasterClock for FakeClock {
     }
     fn set_master(&mut self, device: Option<&str>) {
         self.masters.push(device.map(str::to_owned));
+    }
+    fn now_ns(&self) -> u64 {
+        self.now
     }
 }
 

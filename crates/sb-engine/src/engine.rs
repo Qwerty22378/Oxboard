@@ -33,9 +33,18 @@ impl<E: Endpoints> Engine<E> {
     /// An engine running an empty plan (silence, timer clock), and the core to run on the
     /// mix thread.
     pub fn new(block: usize, tables: Tables, endpoints: E) -> (Self, MixCore) {
-        let first = PlanBuilder::with_tables(block, tables.params.clone(), tables.meters.clone()).build();
-        let (queue, core) = plan_channel(first);
-        let layouts = VecDeque::from([Layout::default()]);
+        Self::with_master(block, tables, endpoints, None)
+    }
+
+    /// Like [`Engine::new`], but the empty plan already plays on `master` (an endpoint ID).
+    /// The mix thread then opens that device during setup, so the first graph with the same
+    /// master doesn't switch clocks mid-stream (opening a device stalls the mix ~20 ms).
+    pub fn with_master(block: usize, tables: Tables, mut endpoints: E, master: Option<&str>) -> (Self, MixCore) {
+        endpoints.master_changed(master);
+        let mut first = PlanBuilder::with_tables(block, tables.params.clone(), tables.meters.clone());
+        first.master_device(master.map(str::to_owned));
+        let (queue, core) = plan_channel(first.build());
+        let layouts = VecDeque::from([Layout::with_master(master.map(str::to_owned))]);
         (
             Self {
                 block,
@@ -142,16 +151,19 @@ impl<E: Endpoints> Engine<E> {
     }
 }
 
-/// Start an engine on WASAPI: the control side, and the mix thread running its core.
+/// Start an engine on WASAPI: the control side, and the mix thread running its core. Pass the
+/// master device the first graph will use (if known), so the mix thread opens it up front.
 #[cfg(windows)]
 pub fn start_wasapi(
     block: usize,
     tables: Tables,
+    master: Option<&str>,
 ) -> windows::core::Result<(
     Engine<crate::backend::wasapi::WasapiEndpoints>,
     crate::rt::mix_thread::MixThread,
 )> {
-    let (engine, core) = Engine::new(block, tables, crate::backend::wasapi::WasapiEndpoints::new(block));
+    let endpoints = crate::backend::wasapi::WasapiEndpoints::new(block);
+    let (engine, core) = Engine::with_master(block, tables, endpoints, master);
     let mix = crate::rt::mix_thread::spawn(core)?;
     Ok((engine, mix))
 }

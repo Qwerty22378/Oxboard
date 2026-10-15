@@ -109,6 +109,14 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// The layout of an empty plan playing (silence) on `master`.
+    pub(crate) fn with_master(master: Option<String>) -> Self {
+        Self {
+            master_device: master,
+            ..Self::default()
+        }
+    }
+
     /// Fades or ghosts present: a settle plan should follow.
     pub fn in_transition(&self) -> bool {
         self.ghosts > 0 || self.edges.iter().any(|(_, s)| *s != EdgeStatus::Steady)

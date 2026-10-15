@@ -4,14 +4,82 @@
 //! The reader keeps the ring near a target fill:
 //! - **Priming:** after start or an underrun, output silence until the ring holds
 //!   `target` frames, so one late capture packet doesn't cause a run of tiny underruns.
-//! - **Trimming:** if the fill climbs past `max` (the capture clock runs faster than the
-//!   render clock), skip frames back down to `target`. This bounds latency until the drift
-//!   resamplers (E6) replace it with a smooth correction.
+//! - **Trimming:** if the fill climbs past `max`, skip frames back down to `target`. A safety
+//!   net only: the drift resamplers (`clock::drift`) keep the fill near the target.
+//!
+//! **Stamps (E6):** the device thread on each ring records its running frame count and the
+//! time ([`RingWriter::stamp`] / [`RingReader::stamp`]). The mix side uses them to estimate
+//! the fill *including frames the device has produced or consumed since its last packet*
+//! ([`RingReader::estimated_fill`] / [`RingWriter::estimated_fill`]). That removes the
+//! sawtooth of bursty device periods, which otherwise aliases into a slow wobble of the
+//! drift controller.
 
 use crate::Frame;
 use crate::rt::stats::StreamStats;
 use rtrb::{Consumer, Producer, RingBuffer};
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
+
+/// Nanoseconds on a process-wide monotonic clock, shared by device threads and the mix.
+pub fn now_ns() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+/// A (frame count, time) pair published by one thread and read by another, without locks
+/// (a seqlock: the writer bumps `seq` to odd, writes, bumps it to even).
+#[derive(Debug, Default)]
+pub struct Stamp {
+    seq: AtomicU64,
+    frames: AtomicU64,
+    ns: AtomicU64,
+}
+
+impl Stamp {
+    pub fn record(&self, frames: u64, ns: u64) {
+        let s = self.seq.load(Relaxed);
+        self.seq.store(s.wrapping_add(1), Relaxed);
+        std::sync::atomic::fence(Release);
+        self.frames.store(frames, Relaxed);
+        self.ns.store(ns, Relaxed);
+        self.seq.store(s.wrapping_add(2), Release);
+    }
+
+    /// Withdraw the stamp (the count isn't advancing at the nominal rate right now).
+    pub fn clear(&self) {
+        self.seq.store(0, Release);
+    }
+
+    /// The last consistent pair, or `None` if never recorded (or mid-write after retries).
+    pub fn load(&self) -> Option<(u64, u64)> {
+        for _ in 0..4 {
+            let s1 = self.seq.load(Acquire);
+            if s1 == 0 {
+                return None;
+            }
+            let (f, t) = (self.frames.load(Relaxed), self.ns.load(Relaxed));
+            std::sync::atomic::fence(Acquire);
+            if s1 % 2 == 0 && self.seq.load(Relaxed) == s1 {
+                return Some((f, t));
+            }
+        }
+        None
+    }
+}
+
+/// Both stamps of one ring.
+#[derive(Debug, Default)]
+pub struct Stamps {
+    /// Frames written so far, by the producer's device thread.
+    pub written: Stamp,
+    /// Frames read so far, by the consumer's device thread.
+    pub read: Stamp,
+}
+
+/// Frames a device moves in `ns` at the nominal rate.
+fn frames_in(ns: i64) -> i64 {
+    ns.max(0) * crate::SAMPLE_RATE as i64 / 1_000_000_000
+}
 
 /// Fill levels for a ring between two bursty sides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,25 +107,64 @@ impl RingSizing {
         }
     }
 
-    /// A ring of this size, with a reader using these levels.
+    /// A ring of this size, with a reader using these levels. Both ends know the target, so
+    /// whichever end the mix holds can steer toward it.
     pub fn ring(self) -> (RingWriter, RingReader) {
-        let (w, c) = ring(self.capacity);
-        (w, RingReader::new(c, self.target, self.max))
+        let (mut w, c) = ring(self.capacity);
+        w.target = self.target;
+        let r = RingReader::new(c, self.target, self.max).with_stamps(w.stamps.clone());
+        (w, r)
     }
 }
 
 /// Create a ring holding up to `capacity` frames.
+/// The writer has target 0 (no drift correction); [`RingSizing::ring`] sets one.
 pub fn ring(capacity: usize) -> (RingWriter, Consumer<Frame>) {
     let (producer, consumer) = RingBuffer::new(capacity);
-    (RingWriter { producer }, consumer)
+    (
+        RingWriter {
+            producer,
+            target: 0,
+            total: 0,
+            stamps: Arc::default(),
+        },
+        consumer,
+    )
 }
 
-/// Producer side: used by a capture thread.
+/// Producer side: a capture thread, or the mix feeding a render thread.
 pub struct RingWriter {
     producer: Producer<Frame>,
+    target: usize,
+    /// Frames written so far.
+    total: u64,
+    stamps: Arc<Stamps>,
 }
 
 impl RingWriter {
+    /// Fill to steer toward when the mix is this end; 0 = same clock, no correction.
+    pub fn target(&self) -> usize {
+        self.target
+    }
+
+    pub fn fill(&self) -> usize {
+        self.producer.buffer().capacity() - self.producer.slots()
+    }
+
+    /// Device thread: publish how much has been written, as of `ns`.
+    pub fn stamp(&self, ns: u64) {
+        self.stamps.written.record(self.total, ns);
+    }
+
+    /// Mix side (feeding a render thread): fill at `now`, counting frames the render device
+    /// has consumed since its last stamp. `None` until the render side is reading (its
+    /// priming phase says nothing about drift).
+    pub fn estimated_fill(&self, now: u64) -> Option<usize> {
+        let (read, at) = self.stamps.read.load()?;
+        let consumed = read as i64 + frames_in(now as i64 - at as i64);
+        Some((self.total as i64 - consumed).max(0) as usize)
+    }
+
     /// Write `frames`, or silence of that length when `frames` is `None`. Returns how many
     /// frames didn't fit and were dropped.
     pub fn write(&mut self, frames: Option<&[Frame]>, len: usize, stats: &StreamStats) -> usize {
@@ -73,6 +180,7 @@ impl RingWriter {
             }
         }
         let dropped = len - fit;
+        self.total += fit as u64;
         StreamStats::add(&stats.frames, fit);
         if dropped > 0 {
             StreamStats::add(&stats.xrun_frames, dropped);
@@ -88,6 +196,9 @@ pub struct RingReader {
     target: usize,
     max: usize,
     primed: bool,
+    /// Frames taken out so far (read or trimmed).
+    total: u64,
+    stamps: Arc<Stamps>,
 }
 
 impl RingReader {
@@ -102,11 +213,51 @@ impl RingReader {
             target,
             max,
             primed: false,
+            total: 0,
+            stamps: Arc::default(),
         }
+    }
+
+    /// Share stamps with the writer of the same ring.
+    pub fn with_stamps(mut self, stamps: Arc<Stamps>) -> Self {
+        self.stamps = stamps;
+        self
     }
 
     pub fn fill(&self) -> usize {
         self.consumer.slots()
+    }
+
+    pub fn target(&self) -> usize {
+        self.target
+    }
+
+    /// Past priming: reading real data.
+    pub fn is_primed(&self) -> bool {
+        self.primed
+    }
+
+    /// Device thread: publish how much has been read, as of `ns`. While priming the device
+    /// consumes nothing from the ring, so extrapolating at the nominal rate would be wrong:
+    /// the stamp is withdrawn and the mix falls back to the plain fill.
+    pub fn stamp(&self, ns: u64) {
+        if self.primed {
+            self.stamps.read.record(self.total, ns);
+        } else {
+            self.stamps.read.clear();
+        }
+    }
+
+    /// Mix side (fed by a capture thread): fill at `now`, counting frames the capture device
+    /// has produced since its last stamp. `None` until the capture side has stamped, or while
+    /// this side is still priming.
+    pub fn estimated_fill(&self, now: u64) -> Option<usize> {
+        if !self.primed {
+            return None;
+        }
+        let (written, at) = self.stamps.written.load()?;
+        let produced = written as i64 + frames_in(now as i64 - at as i64);
+        Some((produced - self.total as i64).max(0) as usize)
     }
 
     /// Fill `out` completely: ring data first, silence for whatever is missing.
@@ -137,6 +288,7 @@ impl RingReader {
             out[a.len()..n].copy_from_slice(b);
             chunk.commit_all();
         }
+        self.total += n as u64;
         StreamStats::add(&stats.frames, n);
 
         if n < out.len() {
@@ -150,6 +302,7 @@ impl RingReader {
     fn skip(&mut self, n: usize) {
         if let Ok(chunk) = self.consumer.read_chunk(n) {
             chunk.commit_all();
+            self.total += n as u64;
         }
     }
 }

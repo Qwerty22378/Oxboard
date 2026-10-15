@@ -9,7 +9,7 @@
 
 use crate::SAMPLE_RATE;
 use crate::clock::master::MasterClock;
-use crate::graph::plan::{Gain, Op, RenderPlan};
+use crate::graph::plan::{Gain, Input, Op, Output, RenderPlan};
 use crate::rt::stats::MixStats;
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::f64::consts::TAU;
@@ -17,8 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Instant;
 
 /// Run every op in the plan once. Returns the master bus (left, right), or silence if the
-/// plan has no `Master` op. Real-time safe: the builder validated every index.
-pub fn render_block(plan: &mut RenderPlan) -> [&[f32]; 2] {
+/// plan has no `Master` op. `now` (ns, `rt::ring::now_ns` time base) dates the drift
+/// controllers' fill estimates. Real-time safe: the builder validated every index.
+pub fn render_block(plan: &mut RenderPlan, now: u64) -> [&[f32]; 2] {
     let RenderPlan {
         block,
         ops,
@@ -42,8 +43,26 @@ pub fn render_block(plan: &mut RenderPlan) -> [&[f32]; 2] {
             Op::Pull { ring, dst } => {
                 let [l, r] = &mut bufs[dst.0];
                 match &mut inputs[ring.0] {
-                    Some(input) => {
-                        input.reader.read(frames, &input.stats);
+                    Some(Input {
+                        reader,
+                        stats,
+                        drift: Some(d),
+                    }) => {
+                        let need = d.input_needed().min(frames.len());
+                        reader.read(&mut frames[..need], stats);
+                        d.pull(&frames[..need], l, r);
+                        if let Some(fill) = reader.estimated_fill(now) {
+                            d.measure(fill);
+                        }
+                        stats.drift_ppm.store((d.ppm() as f32).to_bits(), Relaxed);
+                    }
+                    Some(Input {
+                        reader,
+                        stats,
+                        drift: None,
+                    }) => {
+                        let frames = &mut frames[..*block];
+                        reader.read(frames, stats);
                         for ((f, l), r) in frames.iter().zip(l.iter_mut()).zip(r.iter_mut()) {
                             (*l, *r) = (f[0], f[1]);
                         }
@@ -103,12 +122,27 @@ pub fn render_block(plan: &mut RenderPlan) -> [&[f32]; 2] {
                 meters.measure(meter, [l, r], &mut rms[state.0]);
             }
             Op::Push { src, ring } => {
-                let Some(output) = &mut outputs[ring.0] else { continue };
+                let Some(Output { writer, stats, drift }) = &mut outputs[ring.0] else {
+                    continue;
+                };
                 let [l, r] = &bufs[src.0];
-                for ((f, l), r) in frames.iter_mut().zip(l).zip(r) {
-                    *f = [*l, *r];
+                let n = match drift {
+                    Some(d) => d.push_block(l, r, frames),
+                    None => {
+                        for ((f, l), r) in frames.iter_mut().zip(l).zip(r) {
+                            *f = [*l, *r];
+                        }
+                        *block
+                    }
+                };
+                writer.write(Some(&frames[..n]), n, stats);
+                if let Some(d) = drift {
+                    if let Some(fill) = writer.estimated_fill(now) {
+                        d.measure(fill);
+                        stats.ring_fill.store(fill as u32, Relaxed);
+                    }
+                    stats.drift_ppm.store((d.ppm() as f32).to_bits(), Relaxed);
                 }
-                output.writer.write(Some(frames), *block, &output.stats);
             }
             Op::Master { src } => master = Some(src.0),
         }
@@ -227,7 +261,7 @@ impl MixCore {
     pub fn block(&mut self, clock: &mut impl MasterClock, stats: &MixStats) {
         let start = Instant::now();
         self.adopt(clock, stats);
-        let [l, r] = render_block(&mut self.plan);
+        let [l, r] = render_block(&mut self.plan, clock.now_ns());
         clock.deliver(l, r);
         stats.block_done(start.elapsed().as_nanos() as u64);
     }

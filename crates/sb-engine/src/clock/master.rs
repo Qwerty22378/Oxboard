@@ -17,6 +17,11 @@ pub trait MasterClock {
     /// the mix thread at the swap; opening a device isn't real-time safe, but it's rare and
     /// the output changes at that moment anyway.
     fn set_master(&mut self, device: Option<&str>);
+    /// Current time in ns on the same base device threads stamp their rings with
+    /// (`rt::ring::now_ns`); simulations return simulated time.
+    fn now_ns(&self) -> u64 {
+        crate::rt::ring::now_ns()
+    }
 }
 
 /// How many whole blocks are due after `elapsed_ns` since start, at [`crate::SAMPLE_RATE`].

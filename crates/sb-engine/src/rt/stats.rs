@@ -22,12 +22,14 @@ pub struct StreamStats {
     /// Largest single device request (render) or packet (capture), in frames. A value
     /// well above the period means the thread woke late.
     pub max_chunk: AtomicU32,
+    /// Mix side of a device ring: the drift correction in ppm (f32 bits).
+    pub drift_ppm: AtomicU32,
     /// Whether the thread got its MMCSS "Pro Audio" registration.
     pub mmcss: AtomicBool,
 }
 
 /// Plain copy of [`StreamStats`] for printing and diffing.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct StatsSnapshot {
     pub frames: u64,
     pub xrun_frames: u64,
@@ -36,6 +38,7 @@ pub struct StatsSnapshot {
     pub discontinuities: u64,
     pub ring_fill: u32,
     pub max_chunk: u32,
+    pub drift_ppm: f32,
     pub mmcss: bool,
 }
 
@@ -49,6 +52,7 @@ impl StreamStats {
             discontinuities: self.discontinuities.load(Relaxed),
             ring_fill: self.ring_fill.load(Relaxed),
             max_chunk: self.max_chunk.load(Relaxed),
+            drift_ppm: f32::from_bits(self.drift_ppm.load(Relaxed)),
             mmcss: self.mmcss.load(Relaxed),
         }
     }

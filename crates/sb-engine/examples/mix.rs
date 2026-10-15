@@ -1,8 +1,8 @@
-//! Milestones E2–E5: the engine running a `GraphSpec` on the mix thread, with live params,
-//! meters, and glitch-free graph updates.
+//! Milestones E2–E6: the engine running a `GraphSpec` on the mix thread, with live params,
+//! meters, glitch-free graph updates, and drift correction on every device ring.
 //!
 //!   mix [--in NAME|none] [--out NAME|timer] [--out2 NAME] [--tone HZ] [--tone-gain G]
-//!       [--mic-gain G] [--pulse] [--reroute] [--block FRAMES] [--seconds N]
+//!       [--mic-gain G] [--pulse] [--reroute] [--detail] [--block FRAMES] [--seconds N]
 //!
 //! Graph: mic and a test tone feed a bus; the bus feeds the `--out` device (the master: its
 //! event clocks the mix and the mix writes it directly) and optionally `--out2` (through a
@@ -13,7 +13,9 @@
 //! and 0 every second while running (smoothed, no clicks). `--reroute` applies a new graph
 //! every 2 seconds, swapping the tone for a different tone node (a 5 ms crossfade); the mic
 //! stays connected and its device is never reopened. Each status line shows the mic and bus
-//! meters in dBFS, and how many plans the mix thread has adopted.
+//! meters in dBFS, how many plans the mix thread has adopted, and each ring's drift
+//! correction. `--detail` adds the device side of every ring and reports every 0.25 s for
+//! the first minute (to watch the drift controllers converge).
 
 #[cfg(not(windows))]
 fn main() {
@@ -67,6 +69,7 @@ mod win {
         seconds: Option<u64>,
         pulse: bool,
         reroute: bool,
+        detail: bool,
     }
 
     fn parse_args() -> Result<Args, String> {
@@ -83,6 +86,7 @@ mod win {
             seconds: None,
             pulse: false,
             reroute: false,
+            detail: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -107,10 +111,11 @@ mod win {
                 "--seconds" => a.seconds = Some(num(&arg, value()?)?),
                 "--pulse" => a.pulse = true,
                 "--reroute" => a.reroute = true,
+                "--detail" => a.detail = true,
                 "-h" | "--help" => {
                     println!(
                         "usage: mix [--in NAME|none] [--out NAME|timer] [--out2 NAME] [--tone HZ] [--tone-gain G] \
-                         [--mic-gain G] [--pulse] [--reroute] [--block FRAMES] [--seconds N]"
+                         [--mic-gain G] [--pulse] [--reroute] [--detail] [--block FRAMES] [--seconds N]"
                     );
                     std::process::exit(0);
                 }
@@ -216,7 +221,8 @@ mod win {
             println!("{label:>6}: {}", d.as_ref().map_or("—".into(), |d| d.name.clone()));
         }
 
-        let (mut engine, mix) = start_wasapi(args.block, Tables::new(16, 16))?;
+        let master = dev.out.as_ref().map(|d| d.id.as_str());
+        let (mut engine, mix) = start_wasapi(args.block, Tables::new(16, 16), master)?;
         let mut alt = false;
         engine.apply_graph(&build_spec(&args, &dev, alt))?;
         println!(
@@ -229,7 +235,8 @@ mod win {
         let mut second = 0;
         loop {
             // maintain() often: it retires plans and queues settle plans after fades.
-            for _ in 0..20 {
+            let ticks = if args.detail && second < 60 { 5 } else { 20 };
+            for _ in 0..ticks {
                 std::thread::sleep(Duration::from_millis(50));
                 engine.maintain();
             }
@@ -260,10 +267,19 @@ mod win {
             for ep in engine.running_layout().inputs() {
                 let r = ep.stats.snapshot();
                 print!(
-                    " | mic ring underruns {:<3} trimmed {:<6} fill {:>5.1} ms",
+                    " | mic ring xr {:<2} trim {:<5} fill {:>5.1} ms drift {:>+6.0} ppm",
                     r.xruns,
                     r.trimmed_frames,
-                    frames_to_ms(r.ring_fill as usize)
+                    frames_to_ms(r.ring_fill as usize),
+                    r.drift_ppm
+                );
+            }
+            for ep in engine.running_layout().outputs() {
+                let r = ep.stats.snapshot();
+                print!(
+                    " | out2 ring est {:>5.1} ms drift {:>+6.0} ppm",
+                    frames_to_ms(r.ring_fill as usize),
+                    r.drift_ppm
                 );
             }
             let db = |v: f32| format!("{:>6.1}", to_db(v));
@@ -278,6 +294,18 @@ mod win {
                 && let Some(r) = engine.tables().meters.read(MIC_METER)
             {
                 print!(" | mic pk {} dB", db(r.peak[0].max(r.peak[1])));
+            }
+            if args.detail {
+                for (_, node, st) in &engine.endpoints().streams {
+                    let r = st.stats.snapshot();
+                    print!(
+                        " | dev{} fill {:>5.1} trim {} xr {}",
+                        node.0,
+                        frames_to_ms(r.ring_fill as usize),
+                        r.trimmed_frames,
+                        r.xruns
+                    );
+                }
             }
             println!(" | streams open {}", engine.endpoints().streams.len());
             last = m;

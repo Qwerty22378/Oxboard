@@ -12,6 +12,8 @@ pub mod graph;
 pub mod rt;
 
 #[cfg(test)]
+mod sim;
+#[cfg(test)]
 pub(crate) mod testing;
 
 #[cfg(windows)]

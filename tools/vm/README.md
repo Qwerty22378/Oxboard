@@ -30,11 +30,13 @@ tools/vm/deploy-driver.sh target/vm/<pkg> --hwid 'Root\SoundboardVirtualAudio' [
 package's test cert, installs with `pnputil`, creates the device with `devgen`, and prints device status and recent errors.
 
 User-mode crates (engine, controller) build and run on `sb-build` with `win-cargo.sh`, which syncs the tree
-and runs any cargo command there. `sb-build` has an emulated HDA sound card ("Speakers" / "Line In"), so WASAPI code runs end to end:
+and runs any cargo command there. `sb-build` has two emulated sound cards: HDA ("Speakers" / "Line In") and USB ("Speakers (Audio Device)"),
+each on its own clock, so WASAPI code runs end to end, including drift correction between devices:
 ```bash
 tools/vm/win-cargo.sh test -p sb-engine
 tools/vm/win-cargo.sh run -p sb-engine --release --example passthrough -- --seconds 60   # E1
-tools/vm/win-cargo.sh run -p sb-engine --release --example mix -- --seconds 60           # E2 (--help for options)
+tools/vm/win-cargo.sh run -p sb-engine --release --example mix -- --seconds 60           # E2–E6 (--help for options)
+tools/vm/win-cargo.sh run -p sb-engine --release --example mix -- --out "high definition" --out2 "(audio device)" --detail
 ```
 
 Other commands: `vm.sh status | start | stop | ssh <role> [cmd] | view <role> | seal | revert | password`.

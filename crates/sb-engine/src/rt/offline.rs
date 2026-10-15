@@ -9,7 +9,7 @@ use crate::rt::mix_thread::render_block;
 pub fn render(plan: &mut RenderPlan, blocks: usize) -> Vec<Frame> {
     let mut out = Vec::with_capacity(blocks * plan.block());
     for _ in 0..blocks {
-        let [l, r] = render_block(plan);
+        let [l, r] = render_block(plan, 0);
         out.extend(l.iter().zip(r).map(|(l, r)| [*l, *r]));
     }
     out

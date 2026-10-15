@@ -10,6 +10,7 @@
 //! values, so it never allocates.
 
 use crate::Frame;
+use crate::clock::drift::Drift;
 use crate::graph::spec::{MeterId, ParamId};
 use crate::rt::meters::{MeterTable, RmsState};
 use crate::rt::params::{EDGE_FADE_FRAMES, ParamTable, Smoother};
@@ -97,15 +98,19 @@ pub enum Move {
 /// One input ring as the plan sees it.
 pub struct Input {
     pub reader: RingReader,
-    /// Mix-side counters: frames pulled, underruns, trims.
+    /// Mix-side counters: frames pulled, underruns, trims, drift correction.
     pub stats: Arc<StreamStats>,
+    /// Drift correction into master time; `None` for a ring with target 0 (same clock).
+    pub drift: Option<Drift>,
 }
 
 /// One output ring as the plan sees it.
 pub struct Output {
     pub writer: RingWriter,
-    /// Mix-side counters: frames pushed, overruns.
+    /// Mix-side counters: frames pushed, overruns, drift correction.
     pub stats: Arc<StreamStats>,
+    /// Drift correction out of master time; `None` for a ring with target 0 (same clock).
+    pub drift: Option<Drift>,
 }
 
 pub struct RenderPlan {
@@ -210,7 +215,7 @@ impl PlanBuilder {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 osc_phase: Vec::new(),
-                frames: vec![[0.0; 2]; block],
+                frames: vec![[0.0; 2]; Drift::max_frames(block)],
                 silence: [vec![0.0; block], vec![0.0; block]],
                 params,
                 smoothers: Vec::new(),
@@ -234,9 +239,11 @@ impl PlanBuilder {
     /// Register an input ring; the returned stats are the mix side's view of it.
     pub fn input(&mut self, reader: RingReader) -> (InRing, Arc<StreamStats>) {
         let stats = Arc::new(StreamStats::default());
+        let drift = (reader.target() > 0).then(|| Drift::new(reader.target(), self.plan.block));
         self.plan.inputs.push(Some(Input {
             reader,
             stats: stats.clone(),
+            drift,
         }));
         (InRing(self.plan.inputs.len() - 1), stats)
     }
@@ -252,9 +259,11 @@ impl PlanBuilder {
     /// Register an output ring; the returned stats are the mix side's view of it.
     pub fn output(&mut self, writer: RingWriter) -> (OutRing, Arc<StreamStats>) {
         let stats = Arc::new(StreamStats::default());
+        let drift = (writer.target() > 0).then(|| Drift::new(writer.target(), self.plan.block));
         self.plan.outputs.push(Some(Output {
             writer,
             stats: stats.clone(),
+            drift,
         }));
         (OutRing(self.plan.outputs.len() - 1), stats)
     }

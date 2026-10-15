@@ -10,7 +10,7 @@
 
 use crate::graph::compile::{EndpointKey, Endpoints};
 use crate::graph::spec::NodeId;
-use crate::rt::ring::{RingReader, RingSizing, RingWriter};
+use crate::rt::ring::{RingReader, RingSizing, RingWriter, now_ns};
 use crate::rt::stats::StreamStats;
 use crate::{Frame, SAMPLE_RATE};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -518,6 +518,7 @@ fn capture_loop(c: &Client, mut writer: RingWriter, stats: &StreamStats, stop: &
                 writer.write(Some(frames), len, stats);
             }
             unsafe { capture.ReleaseBuffer(len as u32)? };
+            writer.stamp(now_ns());
         }
     }
     Ok(())
@@ -532,6 +533,7 @@ fn render_loop(c: &Client, mut reader: RingReader, stats: &StreamStats, stop: &A
         let len = c.free_frames()?;
         if len > 0 {
             render.write(len, |out| reader.read(out, stats))?;
+            reader.stamp(now_ns());
         }
     }
     Ok(())
