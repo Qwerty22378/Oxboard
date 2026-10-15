@@ -1,18 +1,24 @@
 //! Graph compiler: `GraphSpec` → `RenderPlan`. Runs off the audio thread.
 //!
-//! 1. **Validate** ids, references, edge directions, values, the master.
-//! 2. **Prune** nodes that feed no sink: they do no work, and their devices aren't opened.
+//! 1. **Validate** ids, references, edge directions, values, the master, meters.
+//! 2. **Prune** nodes that feed no sink and aren't metered: they do no work, and their devices
+//!    aren't opened.
 //! 3. **Sort** topologically (Kahn; ties broken by spec order, so output is deterministic).
 //!    Cycles are rejected with the nodes of one cycle.
 //! 4. **Allocate buffers** by liveness: a node's buffer returns to a free list once its last
 //!    reader has run, so a long chain needs two buffers, not one per node.
 //! 5. **Emit ops.** Buses and sinks with a single fixed-unity input forward that buffer
-//!    instead of copying it. Device rings come from [`Endpoints`].
+//!    instead of copying it. Device rings come from [`Endpoints`]. Meter ops follow the node
+//!    they tap.
 //!
-//! Param-controlled gains use the param's declared value for now; E4 makes them live.
+//! Declared param values are written to the param table before emitting, so the plan's
+//! smoothers start settled at them. After that the controller moves params with
+//! `ParamTable::set`, no recompiling.
 
-use crate::graph::plan::{BufId, Op, PlanBuilder, RenderPlan};
-use crate::graph::spec::{EdgeSpec, GraphError, GraphSpec, NodeId, NodeKind};
+use crate::graph::plan::{self, BufId, Op, PlanBuilder, RenderPlan};
+use crate::graph::spec::{EdgeSpec, GraphError, GraphSpec, MeterId, NodeId, NodeKind, ParamId};
+use crate::rt::meters::MeterTable;
+use crate::rt::params::ParamTable;
 use crate::rt::ring::{RingReader, RingWriter};
 use crate::rt::stats::StreamStats;
 use std::cmp::Reverse;
@@ -26,6 +32,23 @@ pub trait Endpoints {
     fn input(&mut self, node: NodeId, device: &str) -> Result<RingReader, String>;
     /// Ring drained by the render device `device`, for output node `node` (not the master).
     fn output(&mut self, node: NodeId, device: &str) -> Result<RingWriter, String>;
+}
+
+/// The param and meter tables a plan reads and writes, shared with the controller side.
+/// Fixed size: ids index them directly.
+#[derive(Clone)]
+pub struct Tables {
+    pub params: Arc<ParamTable>,
+    pub meters: Arc<MeterTable>,
+}
+
+impl Tables {
+    pub fn new(params: usize, meters: usize) -> Self {
+        Self {
+            params: Arc::new(ParamTable::new(params)),
+            meters: Arc::new(MeterTable::new(meters)),
+        }
+    }
 }
 
 pub struct Compiled {
@@ -48,23 +71,37 @@ struct Graph<'a> {
     /// Outgoing edges per node: destination indices.
     outputs: Vec<Vec<usize>>,
     master: Option<usize>,
+    /// Meters per node.
+    meters: Vec<Vec<MeterId>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Gain {
     /// No param: fixed unity, so forwarding is allowed.
     Unity,
-    Param(f32),
+    Param(ParamId),
 }
 
-pub fn compile(spec: &GraphSpec, block: usize, endpoints: &mut impl Endpoints) -> Result<Compiled, GraphError> {
-    let g = validate(spec)?;
+pub fn compile(
+    spec: &GraphSpec,
+    block: usize,
+    tables: &Tables,
+    endpoints: &mut impl Endpoints,
+) -> Result<Compiled, GraphError> {
+    let g = validate(spec, tables)?;
     let live = live_nodes(&g);
     let order = topo_order(&g)?;
-    emit(&g, &order, &live, block, endpoints)
+    for p in &spec.params {
+        tables.params.set(p.id, p.value);
+    }
+    emit(&g, &order, &live, block, tables, endpoints)
 }
 
-fn validate(spec: &GraphSpec) -> Result<Graph<'_>, GraphError> {
+fn validate<'a>(spec: &'a GraphSpec, tables: &Tables) -> Result<Graph<'a>, GraphError> {
+    let in_range = |kind, id: u32, capacity: usize| match (id as usize) < capacity {
+        true => Ok(()),
+        false => Err(GraphError::IdOutOfRange { kind, id, capacity }),
+    };
     let mut index = HashMap::new();
     for (i, n) in spec.nodes.iter().enumerate() {
         if index.insert(n.id, i).is_some() {
@@ -86,6 +123,7 @@ fn validate(spec: &GraphSpec) -> Result<Graph<'_>, GraphError> {
         if params.insert(p.id, p.value).is_some() {
             return Err(GraphError::DuplicateParam(p.id));
         }
+        in_range("param", p.id.0, tables.params.capacity())?;
         if !p.value.is_finite() {
             return Err(GraphError::InvalidValue(format!("param {} = {}", p.id.0, p.value)));
         }
@@ -113,7 +151,8 @@ fn validate(spec: &GraphSpec) -> Result<Graph<'_>, GraphError> {
         }
         let gain = match gain {
             None => Gain::Unity,
-            Some(p) => Gain::Param(*params.get(&p).ok_or(GraphError::UnknownParam { edge: e, param: p })?),
+            Some(p) if params.contains_key(&p) => Gain::Param(p),
+            Some(p) => return Err(GraphError::UnknownParam { edge: e, param: p }),
         };
         inputs[t].push((f, gain));
         outputs[f].push(t);
@@ -126,18 +165,35 @@ fn validate(spec: &GraphSpec) -> Result<Graph<'_>, GraphError> {
             _ => return Err(GraphError::BadMaster(m)),
         },
     };
+
+    let mut meters = vec![Vec::new(); n];
+    let mut meter_ids = HashSet::new();
+    for m in &spec.meters {
+        if !meter_ids.insert(m.id) {
+            return Err(GraphError::DuplicateMeter(m.id));
+        }
+        in_range("meter", m.id.0, tables.meters.capacity())?;
+        let i = *index.get(&m.node).ok_or(GraphError::UnknownMeterNode {
+            meter: m.id,
+            node: m.node,
+        })?;
+        meters[i].push(m.id);
+    }
     Ok(Graph {
         spec,
         inputs,
         outputs,
         master,
+        meters,
     })
 }
 
-/// Nodes from which some sink is reachable.
+/// Nodes from which some sink or some metered node is reachable.
 fn live_nodes(g: &Graph) -> Vec<bool> {
     let mut live = vec![false; g.spec.nodes.len()];
-    let mut stack: Vec<usize> = (0..live.len()).filter(|&i| g.spec.nodes[i].kind.is_sink()).collect();
+    let mut stack: Vec<usize> = (0..live.len())
+        .filter(|&i| g.spec.nodes[i].kind.is_sink() || !g.meters[i].is_empty())
+        .collect();
     while let Some(i) = stack.pop() {
         if !std::mem::replace(&mut live[i], true) {
             stack.extend(g.inputs[i].iter().map(|&(src, _)| src));
@@ -214,9 +270,10 @@ fn emit(
     order: &[usize],
     live: &[bool],
     block: usize,
+    tables: &Tables,
     endpoints: &mut impl Endpoints,
 ) -> Result<Compiled, GraphError> {
-    let mut b = PlanBuilder::new(block);
+    let mut b = PlanBuilder::with_tables(block, tables.params.clone(), tables.meters.clone());
     let mut bufs = Buffers {
         pending_reads: Vec::new(),
         free: Vec::new(),
@@ -233,8 +290,10 @@ fn emit(
     for &i in order.iter().filter(|&&i| live[i]) {
         let node = &g.spec.nodes[i];
         let endpoint_err = |reason| GraphError::Endpoint { node: node.id, reason };
-        // Every live node is read once per live outgoing edge; sinks also by their own op.
-        let reads = g.outputs[i].iter().filter(|&&t| live[t]).count() + node.kind.is_sink() as usize;
+        // A live node's buffer is read once per live outgoing edge, once per meter, and once
+        // more by a sink's own op.
+        let reads =
+            g.outputs[i].iter().filter(|&&t| live[t]).count() + g.meters[i].len() + node.kind.is_sink() as usize;
 
         let buf = match &node.kind {
             NodeKind::DeviceInput { device } => {
@@ -272,8 +331,8 @@ fn emit(
                     for &(src, gain) in inputs {
                         let src_buf = value[src].expect("inputs come first in topological order");
                         let gain = match gain {
-                            Gain::Unity => 1.0,
-                            Gain::Param(v) => v,
+                            Gain::Unity => plan::Gain::Fixed(1.0),
+                            Gain::Param(id) => b.param_gain(id),
                         };
                         b.op(Op::MixAdd {
                             src: src_buf,
@@ -289,6 +348,10 @@ fn emit(
         if value[i].is_none() {
             bufs.add_reads(buf, reads);
             value[i] = Some(buf);
+        }
+        for &meter in &g.meters[i] {
+            b.meter(buf, meter);
+            bufs.read(buf);
         }
 
         if let NodeKind::DeviceOutput { device } = &node.kind {
@@ -315,8 +378,9 @@ fn emit(
 mod tests {
     use super::*;
     use crate::Frame;
-    use crate::graph::spec::{NodeSpec, ParamId, ParamSpec};
+    use crate::graph::spec::{MeterSpec, NodeSpec, ParamId, ParamSpec};
     use crate::rt::offline;
+    use crate::rt::params::RAMP_FRAMES;
     use crate::rt::ring::ring;
     use rtrb::{Consumer, Producer};
 
@@ -394,12 +458,12 @@ mod tests {
 
     fn compile_ok(spec: &GraphSpec) -> (Compiled, FakeEndpoints) {
         let mut ep = FakeEndpoints::default();
-        let c = compile(spec, 64, &mut ep).unwrap_or_else(|e| panic!("compile failed: {e}"));
+        let c = compile(spec, 64, &Tables::new(256, 16), &mut ep).unwrap_or_else(|e| panic!("compile failed: {e}"));
         (c, ep)
     }
 
     fn compile_err(spec: &GraphSpec) -> GraphError {
-        match compile(spec, 64, &mut FakeEndpoints::default()) {
+        match compile(spec, 64, &Tables::new(256, 16), &mut FakeEndpoints::default()) {
             Ok(_) => panic!("expected an error"),
             Err(e) => e,
         }
@@ -438,6 +502,7 @@ mod tests {
             nodes: vec![input(1, "mic"), tone(2, 0.0, 1.0), bus(3), output(4, "spk")],
             edges: vec![gain_edge(1, 3, 10), edge(2, 3), gain_edge(3, 4, 11)],
             params: vec![param(10, 0.5), param(11, 2.0)],
+            meters: Vec::new(),
             master: Some(NodeId(4)),
         };
         let (mut c, mut ep) = compile_ok(&spec);
@@ -455,6 +520,7 @@ mod tests {
             nodes: vec![tone(1, 100.0, 1.0), bus(2), output(3, "spk")],
             edges: vec![gain_edge(1, 2, 7), edge(2, 3)],
             params: vec![param(7, 1.0)],
+            meters: Vec::new(),
             master: Some(NodeId(3)),
         };
         let (c, _) = compile_ok(&spec);
@@ -551,6 +617,7 @@ mod tests {
             nodes,
             edges,
             params,
+            meters: Vec::new(),
             master: Some(NodeId(21)),
         };
         let (mut c, _) = compile_ok(&spec);
@@ -574,6 +641,163 @@ mod tests {
         let a = compile_ok(&spec).0.order;
         assert_eq!(a, vec![NodeId(2), NodeId(1), NodeId(5), NodeId(9)]);
         assert_eq!(compile_ok(&spec).0.order, a);
+    }
+
+    // ---- params and meters (E4) ----
+
+    fn compile_with(spec: &GraphSpec, tables: &Tables) -> (Compiled, FakeEndpoints) {
+        let mut ep = FakeEndpoints::default();
+        let c = compile(spec, 64, tables, &mut ep).unwrap_or_else(|e| panic!("compile failed: {e}"));
+        (c, ep)
+    }
+
+    /// DC input (1.0) → param gain → master: the output *is* the gain, sample by sample.
+    fn dc_through_param(initial: f32) -> (Compiled, FakeEndpoints, Tables) {
+        let spec = GraphSpec {
+            nodes: vec![input(1, "mic"), output(2, "spk")],
+            edges: vec![gain_edge(1, 2, 3)],
+            params: vec![param(3, initial)],
+            master: Some(NodeId(2)),
+            ..Default::default()
+        };
+        let tables = Tables::new(8, 8);
+        let (c, mut ep) = compile_with(&spec, &tables);
+        ep.feed(1, &vec![[1.0, 1.0]; 4000]);
+        (c, ep, tables)
+    }
+
+    #[test]
+    fn new_plan_starts_at_the_param_value_without_fading_in() {
+        let (mut c, _, _) = dc_through_param(0.5);
+        let out = offline::render(&mut c.plan, 1);
+        assert!(out.iter().all(|f| *f == [0.5, 0.5]), "first samples: {:?}", &out[..4]);
+    }
+
+    #[test]
+    fn param_changes_ramp_without_steps_and_land_exactly() {
+        let (mut c, _, tables) = dc_through_param(1.0);
+        offline::render(&mut c.plan, 1);
+        tables.params.set(ParamId(3), 0.0); // fader down, no recompile
+        let ramp_blocks = (RAMP_FRAMES as usize).div_ceil(64) + 1;
+        let out: Vec<f32> = offline::render(&mut c.plan, ramp_blocks).iter().map(|f| f[0]).collect();
+        let max_step = 1.0 / RAMP_FRAMES as f32 + 1e-5;
+        let mut prev = 1.0;
+        for (i, &v) in out.iter().enumerate() {
+            assert!((prev - v).abs() <= max_step, "step at {i}: {prev} → {v}");
+            prev = v;
+        }
+        assert_eq!(out[RAMP_FRAMES as usize - 1], 0.0, "reaches the target after the ramp");
+        assert!(out[RAMP_FRAMES as usize..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn meters_read_levels_and_taps_cost_no_buffers() {
+        let spec = GraphSpec {
+            nodes: vec![tone(1, 1000.0, 0.5), tone(2, 1000.0, 0.25), bus(3), output(4, "spk")],
+            edges: vec![edge(1, 3), edge(2, 3), edge(3, 4)],
+            meters: vec![
+                MeterSpec {
+                    id: MeterId(0),
+                    node: NodeId(1),
+                },
+                MeterSpec {
+                    id: MeterId(5),
+                    node: NodeId(4),
+                },
+            ],
+            master: Some(NodeId(4)),
+            ..Default::default()
+        };
+        let tables = Tables::new(8, 8);
+        let (mut c, _) = compile_with(&spec, &tables);
+        assert_eq!(
+            c.plan.ops().iter().filter(|op| matches!(op, Op::Meter { .. })).count(),
+            2
+        );
+        offline::render(&mut c.plan, 2000); // ~2.7 s: RMS settles
+        let tone = tables.meters.read(MeterId(0)).unwrap();
+        let sum = tables.meters.read(MeterId(5)).unwrap();
+        assert!((tone.peak[0] - 0.5).abs() < 0.01, "{tone:?}");
+        assert!(
+            (sum.peak[0] - 0.75).abs() < 0.01,
+            "sink meter reads the mixed input: {sum:?}"
+        );
+        assert!((sum.rms[1] - 0.75 / 2f32.sqrt()).abs() < 0.01, "{sum:?}");
+    }
+
+    #[test]
+    fn a_meter_keeps_an_unrouted_input_alive() {
+        let spec = GraphSpec {
+            nodes: vec![input(1, "mic"), output(2, "spk")],
+            meters: vec![MeterSpec {
+                id: MeterId(1),
+                node: NodeId(1),
+            }],
+            master: Some(NodeId(2)),
+            ..Default::default()
+        };
+        let tables = Tables::new(8, 8);
+        let (mut c, mut ep) = compile_with(&spec, &tables);
+        assert_eq!(ep.opened, vec!["mic".to_string()]);
+        ep.feed(1, &vec![[0.3, -0.6]; 64]);
+        let master = offline::render(&mut c.plan, 1);
+        assert!(master.iter().all(|f| *f == [0.0; 2]), "metered, not routed");
+        assert_eq!(tables.meters.read(MeterId(1)).unwrap().peak, [0.3, 0.6]);
+    }
+
+    #[test]
+    fn rejects_bad_meters_and_out_of_range_ids() {
+        let base = || GraphSpec {
+            nodes: vec![tone(1, 440.0, 1.0), output(2, "spk")],
+            edges: vec![edge(1, 2)],
+            master: Some(NodeId(2)),
+            ..Default::default()
+        };
+        let m = |id, node| MeterSpec {
+            id: MeterId(id),
+            node: NodeId(node),
+        };
+        let tables = Tables::new(4, 4);
+        let err = |s: GraphSpec| compile(&s, 64, &tables, &mut FakeEndpoints::default()).err().unwrap();
+        assert_eq!(
+            err(GraphSpec {
+                meters: vec![m(1, 1), m(1, 2)],
+                ..base()
+            }),
+            GraphError::DuplicateMeter(MeterId(1))
+        );
+        assert_eq!(
+            err(GraphSpec {
+                meters: vec![m(1, 9)],
+                ..base()
+            }),
+            GraphError::UnknownMeterNode {
+                meter: MeterId(1),
+                node: NodeId(9)
+            }
+        );
+        assert_eq!(
+            err(GraphSpec {
+                meters: vec![m(4, 1)],
+                ..base()
+            }),
+            GraphError::IdOutOfRange {
+                kind: "meter",
+                id: 4,
+                capacity: 4
+            }
+        );
+        assert_eq!(
+            err(GraphSpec {
+                params: vec![param(7, 1.0)],
+                ..base()
+            }),
+            GraphError::IdOutOfRange {
+                kind: "param",
+                id: 7,
+                capacity: 4
+            }
+        );
     }
 
     // ---- validation ----
@@ -703,7 +927,7 @@ mod tests {
             fail: Some("gone".into()),
             ..Default::default()
         };
-        match compile(&spec, 64, &mut ep) {
+        match compile(&spec, 64, &Tables::new(256, 16), &mut ep) {
             Err(GraphError::Endpoint { node, reason }) => {
                 assert_eq!(node, NodeId(1));
                 assert!(reason.contains("not found"));

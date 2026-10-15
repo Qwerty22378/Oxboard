@@ -5,7 +5,7 @@
 
 use crate::SAMPLE_RATE;
 use crate::clock::master::MasterClock;
-use crate::graph::plan::{Op, RenderPlan};
+use crate::graph::plan::{Gain, Op, RenderPlan};
 use crate::rt::stats::MixStats;
 use std::f64::consts::TAU;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -23,6 +23,10 @@ pub fn render_block(plan: &mut RenderPlan) -> [&[f32]; 2] {
         osc_phase,
         frames,
         silence,
+        params,
+        smoothers,
+        meters,
+        rms,
     } = plan;
     let mut master = None;
     for op in ops.iter() {
@@ -48,12 +52,28 @@ pub fn render_block(plan: &mut RenderPlan) -> [&[f32]; 2] {
             Op::Clear { dst } => bufs[dst.0].iter_mut().for_each(|ch| ch.fill(0.0)),
             Op::MixAdd { src, dst, gain } => {
                 if let Ok([s, d]) = bufs.get_disjoint_mut([src.0, dst.0]) {
-                    for (s, d) in s.iter().zip(d.iter_mut()) {
-                        for (s, d) in s.iter().zip(d.iter_mut()) {
-                            *d += s * gain;
+                    match gain {
+                        Gain::Fixed(g) => mix_add(s, d, g),
+                        Gain::Param { id, smoother } => {
+                            let sm = &mut smoothers[smoother.0];
+                            sm.set_target(params.get(id));
+                            if sm.is_ramping() {
+                                let ([sl, sr], [dl, dr]) = (s, d);
+                                for (((sl, sr), dl), dr) in sl.iter().zip(sr.iter()).zip(dl.iter_mut()).zip(dr) {
+                                    let g = sm.tick();
+                                    *dl += sl * g;
+                                    *dr += sr * g;
+                                }
+                            } else {
+                                mix_add(s, d, sm.value());
+                            }
                         }
                     }
                 }
+            }
+            Op::Meter { src, meter, state } => {
+                let [l, r] = &bufs[src.0];
+                meters.measure(meter, [l, r], &mut rms[state.0]);
             }
             Op::Push { src, ring } => {
                 let [l, r] = &bufs[src.0];
@@ -69,6 +89,15 @@ pub fn render_block(plan: &mut RenderPlan) -> [&[f32]; 2] {
     match master {
         Some(i) => [&bufs[i][0], &bufs[i][1]],
         None => [&silence[0], &silence[1]],
+    }
+}
+
+/// `dst += src × g` on both channels.
+fn mix_add(src: &[Vec<f32>; 2], dst: &mut [Vec<f32>; 2], g: f32) {
+    for (s, d) in src.iter().zip(dst.iter_mut()) {
+        for (s, d) in s.iter().zip(d.iter_mut()) {
+            *d += s * g;
+        }
     }
 }
 
@@ -242,17 +271,17 @@ mod tests {
         .op(Op::MixAdd {
             src: mic,
             dst: bus,
-            gain: 0.5,
+            gain: Gain::Fixed(0.5),
         })
         .op(Op::MixAdd {
             src: tone,
             dst: bus,
-            gain: 1.0,
+            gain: Gain::Fixed(1.0),
         })
         .op(Op::MixAdd {
             src: mic,
             dst: bus,
-            gain: 0.25,
+            gain: Gain::Fixed(0.25),
         })
         .op(Op::Master { src: bus });
         let mut plan = b.build();
@@ -275,7 +304,7 @@ mod tests {
             .op(Op::MixAdd {
                 src: s,
                 dst: bus,
-                gain: 1.0,
+                gain: Gain::Fixed(1.0),
             })
             .op(Op::Master { src: bus });
         let (out, _) = render(&mut b.build(), 20);

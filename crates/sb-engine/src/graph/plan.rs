@@ -2,9 +2,12 @@
 //! touches (scratch buffers, rings, node state), all allocated up front.
 //!
 //! The graph compiler (`graph::compile`) emits plans from a `GraphSpec`; [`PlanBuilder`] also
-//! works by hand, for tests. Gains are constants until the param table arrives (E4).
+//! works by hand, for tests. The param and meter tables are shared with the controller side.
 
 use crate::Frame;
+use crate::graph::spec::{MeterId, ParamId};
+use crate::rt::meters::{MeterTable, RmsState};
+use crate::rt::params::{ParamTable, Smoother};
 use crate::rt::ring::{RingReader, RingWriter};
 use crate::rt::stats::StreamStats;
 use std::sync::Arc;
@@ -25,6 +28,24 @@ pub struct OutRing(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OscId(pub usize);
 
+/// A smoother's slot in the plan (one per op that uses a param).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmootherId(pub usize);
+
+/// A meter op's RMS state slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RmsId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Gain {
+    Fixed(f32),
+    /// Follows `id` in the param table, smoothed per sample by `smoother`.
+    Param {
+        id: ParamId,
+        smoother: SmootherId,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Op {
     /// Input ring → `dst`. Silence (and an xrun count) if the ring runs dry.
@@ -39,7 +60,9 @@ pub enum Op {
     /// Zero `dst`, e.g. a bus before mixing into it.
     Clear { dst: BufId },
     /// `dst += src × gain`.
-    MixAdd { src: BufId, dst: BufId, gain: f32 },
+    MixAdd { src: BufId, dst: BufId, gain: Gain },
+    /// Peak + RMS of `src` → meter table slot `meter`.
+    Meter { src: BufId, meter: MeterId, state: RmsId },
     /// `src` → output ring.
     Push { src: BufId, ring: OutRing },
     /// `src` is what the master clock's device plays (written directly, no ring).
@@ -73,6 +96,10 @@ pub struct RenderPlan {
     pub(crate) frames: Vec<Frame>,
     /// Played when the plan has no `Master` op.
     pub(crate) silence: [Vec<f32>; 2],
+    pub(crate) params: Arc<ParamTable>,
+    pub(crate) smoothers: Vec<Smoother>,
+    pub(crate) meters: Arc<MeterTable>,
+    pub(crate) rms: Vec<RmsState>,
 }
 
 impl RenderPlan {
@@ -97,7 +124,12 @@ pub struct PlanBuilder {
 }
 
 impl PlanBuilder {
+    /// A builder with empty param and meter tables, for plans that use neither.
     pub fn new(block: usize) -> Self {
+        Self::with_tables(block, Arc::new(ParamTable::new(0)), Arc::new(MeterTable::new(0)))
+    }
+
+    pub fn with_tables(block: usize, params: Arc<ParamTable>, meters: Arc<MeterTable>) -> Self {
         assert!(block > 0, "block size must be > 0");
         Self {
             plan: RenderPlan {
@@ -109,8 +141,33 @@ impl PlanBuilder {
                 osc_phase: Vec::new(),
                 frames: vec![[0.0; 2]; block],
                 silence: [vec![0.0; block], vec![0.0; block]],
+                params,
+                smoothers: Vec::new(),
+                meters,
+                rms: Vec::new(),
             },
         }
+    }
+
+    /// A gain that follows param `id`, with its own smoother starting at the param's current
+    /// value (so a new plan doesn't fade in).
+    pub fn param_gain(&mut self, id: ParamId) -> Gain {
+        assert!(
+            (id.0 as usize) < self.plan.params.capacity(),
+            "param {id:?} out of range"
+        );
+        self.plan.smoothers.push(Smoother::new(self.plan.params.get(id)));
+        Gain::Param {
+            id,
+            smoother: SmootherId(self.plan.smoothers.len() - 1),
+        }
+    }
+
+    /// Append a meter op on `src`, with fresh RMS state.
+    pub fn meter(&mut self, src: BufId, meter: MeterId) -> &mut Self {
+        self.plan.rms.push(RmsState::default());
+        let state = RmsId(self.plan.rms.len() - 1);
+        self.op(Op::Meter { src, meter, state })
     }
 
     pub fn buffer(&mut self) -> BufId {
@@ -159,10 +216,21 @@ impl PlanBuilder {
                 buf(dst);
             }
             Op::Clear { dst } => buf(dst),
-            Op::MixAdd { src, dst, .. } => {
+            Op::MixAdd { src, dst, gain } => {
                 buf(src);
                 buf(dst);
                 assert_ne!(src, dst, "{op:?}: src and dst must differ");
+                if let Gain::Param { smoother, .. } = gain {
+                    assert!(
+                        smoother.0 < p.smoothers.len(),
+                        "{op:?}: unknown smoother (use param_gain)"
+                    );
+                }
+            }
+            Op::Meter { src, meter, state } => {
+                buf(src);
+                assert!((meter.0 as usize) < p.meters.capacity(), "{op:?}: meter out of range");
+                assert!(state.0 < p.rms.len(), "{op:?}: unknown RMS state (use meter)");
             }
             Op::Push { src, ring } => {
                 buf(src);

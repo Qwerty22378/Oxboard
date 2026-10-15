@@ -1,12 +1,17 @@
-//! Milestones E2 + E3: a `GraphSpec`, compiled to a render plan, run by the mix thread.
+//! Milestones E2–E4: a `GraphSpec`, compiled to a render plan, run by the mix thread, with
+//! live params and meters.
 //!
 //!   mix [--in NAME|none] [--out NAME|timer] [--out2 NAME] [--tone HZ] [--tone-gain G]
-//!       [--mic-gain G] [--block FRAMES] [--seconds N]
+//!       [--mic-gain G] [--pulse] [--block FRAMES] [--seconds N]
 //!
 //! Graph: mic and a test tone feed a bus; the bus feeds the `--out` device (the master: its
 //! event clocks the mix and the mix writes it directly) and optionally `--out2` (through a
 //! ring, on its own render thread). With `--out timer` a high-resolution timer clocks the mix.
 //! Device NAME: part of the name or the full ID; omitted means the default device.
+//!
+//! The tone reaches the bus through a param edge; `--pulse` switches that param between 1
+//! and 0 every second while running (smoothed, no clicks). Each status line shows the mic
+//! and bus meters in dBFS.
 
 #[cfg(not(windows))]
 fn main() {
@@ -26,8 +31,11 @@ fn main() {
 mod win {
     use sb_engine::backend::wasapi::{self, ComGuard, Direction, WasapiEndpoints};
     use sb_engine::frames_to_ms;
-    use sb_engine::graph::compile::compile;
-    use sb_engine::graph::spec::{EdgeSpec, GraphSpec, NodeId, NodeKind, NodeSpec, ParamId, ParamSpec};
+    use sb_engine::graph::compile::{Tables, compile};
+    use sb_engine::graph::spec::{
+        EdgeSpec, GraphSpec, MeterId, MeterSpec, NodeId, NodeKind, NodeSpec, ParamId, ParamSpec,
+    };
+    use sb_engine::rt::meters::to_db;
     use sb_engine::rt::mix_thread;
     use sb_engine::rt::stats::MixSnapshot;
     use std::time::{Duration, Instant};
@@ -38,6 +46,9 @@ mod win {
     const OUT: NodeId = NodeId(4);
     const OUT2: NodeId = NodeId(5);
     const MIC_GAIN: ParamId = ParamId(1);
+    const TONE_ON: ParamId = ParamId(2);
+    const MIC_METER: MeterId = MeterId(0);
+    const BUS_METER: MeterId = MeterId(1);
 
     struct Args {
         input: Option<String>,
@@ -50,6 +61,7 @@ mod win {
         mic_gain: f32,
         block: usize,
         seconds: Option<u64>,
+        pulse: bool,
     }
 
     fn parse_args() -> Result<Args, String> {
@@ -64,6 +76,7 @@ mod win {
             mic_gain: 1.0,
             block: 256,
             seconds: None,
+            pulse: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -86,10 +99,11 @@ mod win {
                 "--mic-gain" => a.mic_gain = num(&arg, value()?)?,
                 "--block" => a.block = num(&arg, value()?)?,
                 "--seconds" => a.seconds = Some(num(&arg, value()?)?),
+                "--pulse" => a.pulse = true,
                 "-h" | "--help" => {
                     println!(
                         "usage: mix [--in NAME|none] [--out NAME|timer] [--out2 NAME] [--tone HZ] [--tone-gain G] \
-                         [--mic-gain G] [--block FRAMES] [--seconds N]"
+                         [--mic-gain G] [--pulse] [--block FRAMES] [--seconds N]"
                     );
                     std::process::exit(0);
                 }
@@ -130,7 +144,7 @@ mod win {
             },
         );
         add(BUS, NodeKind::Bus);
-        let mut edges = vec![(TONE, BUS, None)];
+        let mut edges = vec![(TONE, BUS, Some(TONE_ON))];
         if let Some(d) = &mic {
             add(MIC, NodeKind::DeviceInput { device: d.id.clone() });
             edges.push((MIC, BUS, Some(MIC_GAIN)));
@@ -152,14 +166,31 @@ mod win {
             .into_iter()
             .map(|(from, to, gain)| EdgeSpec { from, to, gain })
             .collect();
-        spec.params = vec![ParamSpec {
-            id: MIC_GAIN,
-            value: args.mic_gain,
+        spec.params = vec![
+            ParamSpec {
+                id: MIC_GAIN,
+                value: args.mic_gain,
+            },
+            ParamSpec {
+                id: TONE_ON,
+                value: 1.0,
+            },
+        ];
+        spec.meters = vec![MeterSpec {
+            id: BUS_METER,
+            node: BUS,
         }];
+        if mic.is_some() {
+            spec.meters.push(MeterSpec {
+                id: MIC_METER,
+                node: MIC,
+            });
+        }
         spec.master = out.as_ref().map(|_| OUT);
 
         let mut endpoints = WasapiEndpoints::new(args.block, out.as_ref().map(|d| d.id.as_str()))?;
-        let compiled = compile(&spec, args.block, &mut endpoints)?;
+        let tables = Tables::new(16, 16);
+        let compiled = compile(&spec, args.block, &tables, &mut endpoints)?;
         let plan = &compiled.plan;
         println!(
             "plan: {} ops, {} buffers, {} frames ({:.2} ms) per block",
@@ -223,8 +254,25 @@ mod win {
                     frames_to_ms(s.ring_fill as usize)
                 );
             }
+            let db = |v: f32| format!("{:>6.1}", to_db(v));
+            if let Some(r) = tables.meters.read(BUS_METER) {
+                print!(
+                    " | bus pk {} rms {} dB",
+                    db(r.peak[0].max(r.peak[1])),
+                    db(r.rms[0].max(r.rms[1]))
+                );
+            }
+            if mic.is_some()
+                && let Some(r) = tables.meters.read(MIC_METER)
+            {
+                print!(" | mic pk {} dB", db(r.peak[0].max(r.peak[1])));
+            }
             println!();
             last = m;
+            if args.pulse {
+                let on = start.elapsed().as_secs() % 2 == 0;
+                tables.params.set(TONE_ON, if on { 1.0 } else { 0.0 });
+            }
 
             let ended = mix.is_finished() || endpoints.streams.iter().any(|(_, s)| s.is_finished());
             if ended || args.seconds.is_some_and(|s| start.elapsed().as_secs() >= s) {

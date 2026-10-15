@@ -15,12 +15,19 @@ pub struct NodeId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ParamId(pub u32);
 
+/// A meter slot: peak and RMS of one node's output, read by the controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MeterId(pub u32);
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GraphSpec {
     pub nodes: Vec<NodeSpec>,
     pub edges: Vec<EdgeSpec>,
     /// Every param an edge refers to, with its initial value.
     pub params: Vec<ParamSpec>,
+    /// Taps on node outputs. A metered node is kept running even if it feeds no sink, so an
+    /// input can show a level before it's routed anywhere.
+    pub meters: Vec<MeterSpec>,
     /// The device output whose clock drives the mix. `None`: a timer drives it.
     pub master: Option<NodeId>,
 }
@@ -61,16 +68,37 @@ pub struct EdgeSpec {
     pub gain: Option<ParamId>,
 }
 
+/// A param an edge refers to. `value` is written to the engine's param table when the graph
+/// is applied; afterwards `set_param` changes it without a rebuild.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ParamSpec {
     pub id: ParamId,
     pub value: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeterSpec {
+    pub id: MeterId,
+    /// For a bus or sink, the meter reads its mixed input.
+    pub node: NodeId,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum GraphError {
     DuplicateNode(NodeId),
     DuplicateParam(ParamId),
+    DuplicateMeter(MeterId),
+    /// A param or meter id is past the end of the engine's fixed-size table.
+    IdOutOfRange {
+        kind: &'static str,
+        id: u32,
+        capacity: usize,
+    },
+    /// A meter taps a node that doesn't exist.
+    UnknownMeterNode {
+        meter: MeterId,
+        node: NodeId,
+    },
     /// Edge `edge` (index into `edges`) names a node that doesn't exist.
     UnknownNode {
         edge: usize,
@@ -110,6 +138,9 @@ impl fmt::Display for GraphError {
         match self {
             DuplicateNode(n) => write!(f, "node {} is defined twice", n.0),
             DuplicateParam(p) => write!(f, "param {} is defined twice", p.0),
+            DuplicateMeter(m) => write!(f, "meter {} is defined twice", m.0),
+            IdOutOfRange { kind, id, capacity } => write!(f, "{kind} id {id} is out of range (table holds {capacity})"),
+            UnknownMeterNode { meter, node } => write!(f, "meter {} taps unknown node {}", meter.0, node.0),
             UnknownNode { edge, node } => write!(f, "edge {edge} refers to unknown node {}", node.0),
             UnknownParam { edge, param } => write!(f, "edge {edge} refers to undeclared param {}", param.0),
             DuplicateEdge { from, to } => write!(f, "more than one edge from node {} to node {}", from.0, to.0),
