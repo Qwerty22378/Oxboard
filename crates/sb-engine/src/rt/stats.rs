@@ -78,6 +78,8 @@ pub struct MixStats {
     pub max_block_ns: AtomicU64,
     /// Timer clock only: blocks skipped because the thread fell too far behind to catch up.
     pub late_blocks: AtomicU64,
+    /// Plans adopted (graph updates, including settle plans).
+    pub swaps: AtomicU64,
     /// The master device failed and the timer clock took over.
     pub master_fallback: AtomicBool,
     /// Whether the thread got its MMCSS "Pro Audio" registration.
@@ -90,6 +92,7 @@ pub struct MixSnapshot {
     pub busy_ns: u64,
     pub max_block_ns: u64,
     pub late_blocks: u64,
+    pub swaps: u64,
     pub master_fallback: bool,
     pub mmcss: bool,
 }
@@ -101,6 +104,7 @@ impl MixStats {
             busy_ns: self.busy_ns.load(Relaxed),
             max_block_ns: self.max_block_ns.load(Relaxed),
             late_blocks: self.late_blocks.load(Relaxed),
+            swaps: self.swaps.load(Relaxed),
             master_fallback: self.master_fallback.load(Relaxed),
             mmcss: self.mmcss.load(Relaxed),
         }

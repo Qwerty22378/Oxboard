@@ -13,6 +13,10 @@ pub trait MasterClock {
     fn wait(&mut self) -> usize;
     /// Take one rendered block of the master bus (planar, one block long).
     fn deliver(&mut self, left: &[f32], right: &[f32]);
+    /// A newly adopted plan plays on a different master device (`None`: timer). Called on
+    /// the mix thread at the swap; opening a device isn't real-time safe, but it's rare and
+    /// the output changes at that moment anyway.
+    fn set_master(&mut self, device: Option<&str>);
 }
 
 /// How many whole blocks are due after `elapsed_ns` since start, at [`crate::SAMPLE_RATE`].
@@ -69,18 +73,19 @@ mod win {
         render: RenderBuffer,
     }
 
+    impl Device {
+        fn open(id: &str) -> Result<Self> {
+            let client = Client::open(id)?;
+            let render = client.start_render()?;
+            Ok(Device { client, render })
+        }
+    }
+
     impl Clock {
         /// Open `master` (a render endpoint ID) as the clock, or run on the timer if `None`.
         /// Must be called on the mix thread, with COM initialized.
         pub fn new(master: Option<&str>, block: usize, stats: Arc<MixStats>) -> Result<Self> {
-            let device = match master {
-                Some(id) => {
-                    let client = Client::open(id)?;
-                    let render = client.start_render()?;
-                    Some(Device { client, render })
-                }
-                None => None,
-            };
+            let device = master.map(Device::open).transpose()?;
             Ok(Self {
                 device,
                 timer: Timer::new(block)?,
@@ -120,6 +125,18 @@ mod win {
                     self.fall_back();
                     0
                 }
+            }
+        }
+
+        fn set_master(&mut self, device: Option<&str>) {
+            self.device = None; // stop the old device first
+            match device.map(Device::open) {
+                None => self.timer.restart(),
+                Some(Ok(d)) => {
+                    self.device = Some(d);
+                    self.stats.master_fallback.store(false, Relaxed);
+                }
+                Some(Err(_)) => self.fall_back(),
             }
         }
 

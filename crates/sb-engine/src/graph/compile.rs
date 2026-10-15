@@ -1,22 +1,25 @@
 //! Graph compiler: `GraphSpec` → `RenderPlan`. Runs off the audio thread.
 //!
 //! 1. **Validate** ids, references, edge directions, values, the master, meters.
-//! 2. **Prune** nodes that feed no sink and aren't metered: they do no work, and their devices
+//! 2. **Transition** (when compiling against the running plan's [`Layout`]): edges that are new
+//!    fade in; edges and nodes that are gone stay as **ghosts** that fade out. A later
+//!    **settle** plan drops the ghosts once the fades are done.
+//! 3. **Prune** nodes that feed no sink and aren't metered: they do no work, and their devices
 //!    aren't opened.
-//! 3. **Sort** topologically (Kahn; ties broken by spec order, so output is deterministic).
-//!    Cycles are rejected with the nodes of one cycle.
-//! 4. **Allocate buffers** by liveness: a node's buffer returns to a free list once its last
+//! 4. **Sort** topologically (Kahn; ties broken by declaration order, so output is
+//!    deterministic). Cycles are rejected with the nodes of one cycle.
+//! 5. **Allocate buffers** by liveness: a node's buffer returns to a free list once its last
 //!    reader has run, so a long chain needs two buffers, not one per node.
-//! 5. **Emit ops.** Buses and sinks with a single fixed-unity input forward that buffer
-//!    instead of copying it. Device rings come from [`Endpoints`]. Meter ops follow the node
-//!    they tap.
+//! 6. **Emit ops.** A bus or sink with a single fixed-unity, steady input forwards that
+//!    buffer instead of copying it. State that already exists in the running plan (rings,
+//!    oscillator phase, smoothers, fades, meter RMS) is **inherited** by key — node, edge or
+//!    meter — through handoff moves; only new device nodes open endpoints.
 //!
-//! Declared param values are written to the param table before emitting, so the plan's
-//! smoothers start settled at them. After that the controller moves params with
-//! `ParamTable::set`, no recompiling.
+//! Declared param values are written to the param table before emitting, so new smoothers
+//! start settled at them. After that the controller moves params with `ParamTable::set`.
 
 use crate::graph::plan::{self, BufId, Op, PlanBuilder, RenderPlan};
-use crate::graph::spec::{EdgeSpec, GraphError, GraphSpec, MeterId, NodeId, NodeKind, ParamId};
+use crate::graph::spec::{EdgeSpec, GraphError, GraphSpec, MeterId, NodeId, NodeKind, NodeSpec, ParamId};
 use crate::rt::meters::MeterTable;
 use crate::rt::params::ParamTable;
 use crate::rt::ring::{RingReader, RingWriter};
@@ -25,13 +28,22 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
-/// Opens the device side of rings. The WASAPI backend starts real streams; tests hand out
-/// rings they keep the other end of.
+/// Identifies one opened device endpoint (one stream), so it can be released exactly once,
+/// even if a node id is reused while the old stream is still fading out.
+pub type EndpointKey = u64;
+
+/// Opens and closes the device side of rings. The WASAPI backend starts real streams; tests
+/// hand out rings they keep the other end of.
 pub trait Endpoints {
     /// Ring fed by the capture device `device`, for input node `node`.
-    fn input(&mut self, node: NodeId, device: &str) -> Result<RingReader, String>;
+    fn input(&mut self, node: NodeId, device: &str) -> Result<(RingReader, EndpointKey), String>;
     /// Ring drained by the render device `device`, for output node `node` (not the master).
-    fn output(&mut self, node: NodeId, device: &str) -> Result<RingWriter, String>;
+    fn output(&mut self, node: NodeId, device: &str) -> Result<(RingWriter, EndpointKey), String>;
+    /// No plan uses this endpoint any more: close it.
+    fn release(&mut self, key: EndpointKey);
+    /// The master device is about to change (it sets how bursty the mix is, which sizes
+    /// new rings).
+    fn master_changed(&mut self, _device: Option<&str>) {}
 }
 
 /// The param and meter tables a plan reads and writes, shared with the controller side.
@@ -51,28 +63,156 @@ impl Tables {
     }
 }
 
-pub struct Compiled {
-    pub plan: RenderPlan,
-    /// Endpoint ID of the master device; the mix thread's clock opens it. `None`: timer.
-    pub master_device: Option<String>,
-    /// Nodes that do work, in execution order (pruned nodes are absent).
-    pub order: Vec<NodeId>,
-    /// Mix-side stats of every input ring, by node.
-    pub input_stats: Vec<(NodeId, Arc<StreamStats>)>,
-    /// Mix-side stats of every output ring, by node.
-    pub output_stats: Vec<(NodeId, Arc<StreamStats>)>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeStatus {
+    Steady,
+    FadingIn,
+    /// A ghost: gone from the spec, fading out until the settle plan drops it.
+    FadingOut,
 }
 
-/// Validated graph, by index into `spec.nodes`.
-struct Graph<'a> {
-    spec: &'a GraphSpec,
-    /// Incoming edges per node, in spec order: (source index, gain).
-    inputs: Vec<Vec<(usize, Gain)>>,
-    /// Outgoing edges per node: destination indices.
-    outputs: Vec<Vec<usize>>,
-    master: Option<usize>,
-    /// Meters per node.
-    meters: Vec<Vec<MeterId>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Fade new edges in and removed edges (and nodes) out, relative to the previous layout.
+    Transition,
+    /// Every edge steady, no ghosts. After a transition this plan waits for its fades.
+    Settle,
+}
+
+/// One opened endpoint as a plan uses it.
+#[derive(Debug, Clone)]
+pub struct Endpoint {
+    pub node: NodeId,
+    pub key: EndpointKey,
+    /// Mix-side counters of the ring.
+    pub stats: Arc<StreamStats>,
+}
+
+/// An edge's identity: its two nodes and its gain source. Changing an edge's gain from fixed
+/// to a param (or to another param) makes it a different edge: the old one fades out while
+/// the new one fades in, instead of the gain jumping.
+type EdgeKey = (NodeId, NodeId, Option<ParamId>);
+
+/// What a compiled plan contains, by stable key: the next compile inherits from it.
+#[derive(Debug, Clone, Default)]
+pub struct Layout {
+    nodes: Vec<NodeSpec>,
+    edges: Vec<(EdgeSpec, EdgeStatus)>,
+    ghosts: usize,
+    master_device: Option<String>,
+    inputs: Vec<Endpoint>,
+    outputs: Vec<Endpoint>,
+    oscs: Vec<NodeId>,
+    smoothers: Vec<EdgeKey>,
+    fades: Vec<EdgeKey>,
+    rms: Vec<(MeterId, NodeId)>,
+}
+
+impl Layout {
+    /// Fades or ghosts present: a settle plan should follow.
+    pub fn in_transition(&self) -> bool {
+        self.ghosts > 0 || self.edges.iter().any(|(_, s)| *s != EdgeStatus::Steady)
+    }
+
+    /// Nodes that do work (including ghosts), in execution order.
+    pub fn nodes(&self) -> &[NodeSpec] {
+        &self.nodes
+    }
+
+    pub fn edge_status(&self, from: NodeId, to: NodeId) -> Option<EdgeStatus> {
+        self.edges
+            .iter()
+            .find(|(e, _)| e.from == from && e.to == to)
+            .map(|(_, s)| *s)
+    }
+
+    pub fn master_device(&self) -> Option<&str> {
+        self.master_device.as_deref()
+    }
+
+    pub fn inputs(&self) -> &[Endpoint] {
+        &self.inputs
+    }
+
+    pub fn outputs(&self) -> &[Endpoint] {
+        &self.outputs
+    }
+
+    pub fn uses_endpoint(&self, key: EndpointKey) -> bool {
+        self.inputs.iter().chain(&self.outputs).any(|e| e.key == key)
+    }
+
+    pub fn endpoint_keys(&self) -> impl Iterator<Item = EndpointKey> + '_ {
+        self.inputs.iter().chain(&self.outputs).map(|e| e.key)
+    }
+}
+
+pub struct Compiled {
+    pub plan: RenderPlan,
+    pub layout: Layout,
+}
+
+/// Compile with no running plan to inherit from: every edge steady, nothing fades.
+pub fn compile(
+    spec: &GraphSpec,
+    block: usize,
+    tables: &Tables,
+    endpoints: &mut impl Endpoints,
+) -> Result<Compiled, GraphError> {
+    compile_against(spec, block, tables, endpoints, &Layout::default(), Mode::Settle)
+}
+
+/// Compile `spec` to replace the plan described by `prev`. On error nothing it opened stays
+/// open, and the running plan is untouched.
+pub fn compile_against(
+    spec: &GraphSpec,
+    block: usize,
+    tables: &Tables,
+    endpoints: &mut impl Endpoints,
+    prev: &Layout,
+    mode: Mode,
+) -> Result<Compiled, GraphError> {
+    let mut g = validate(spec, tables)?;
+    let order = match mode {
+        Mode::Settle => topo_order(&g)?,
+        Mode::Transition => {
+            transition(&mut g, prev, true);
+            match topo_order(&g) {
+                Ok(order) => order,
+                // Old and new edges together can form a cycle (A→B removed, B→A added): give
+                // up the fade-outs rather than the update.
+                Err(GraphError::Cycle(_)) => {
+                    g = validate(spec, tables)?;
+                    transition(&mut g, prev, false);
+                    topo_order(&g)?
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    let live = live_nodes(&g);
+    for p in &spec.params {
+        tables.params.set(p.id, p.value);
+    }
+    let wait_for_fades = mode == Mode::Settle && prev.in_transition();
+    let mut opened = Vec::new();
+    let result = emit(
+        &g,
+        &order,
+        &live,
+        block,
+        tables,
+        endpoints,
+        prev,
+        wait_for_fades,
+        &mut opened,
+    );
+    if result.is_err() {
+        for key in opened {
+            endpoints.release(key);
+        }
+    }
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,22 +222,38 @@ enum Gain {
     Param(ParamId),
 }
 
-pub fn compile(
-    spec: &GraphSpec,
-    block: usize,
-    tables: &Tables,
-    endpoints: &mut impl Endpoints,
-) -> Result<Compiled, GraphError> {
-    let g = validate(spec, tables)?;
-    let live = live_nodes(&g);
-    let order = topo_order(&g)?;
-    for p in &spec.params {
-        tables.params.set(p.id, p.value);
-    }
-    emit(&g, &order, &live, block, tables, endpoints)
+#[derive(Debug, Clone, Copy)]
+struct InEdge {
+    src: usize,
+    gain: Gain,
+    status: EdgeStatus,
 }
 
-fn validate<'a>(spec: &'a GraphSpec, tables: &Tables) -> Result<Graph<'a>, GraphError> {
+/// Validated graph, by node index.
+struct Graph {
+    nodes: Vec<NodeSpec>,
+    /// Incoming edges per node, in declaration order.
+    inputs: Vec<Vec<InEdge>>,
+    /// Outgoing edges per node: destination indices.
+    outputs: Vec<Vec<usize>>,
+    master: Option<usize>,
+    /// Meters per node.
+    meters: Vec<Vec<MeterId>>,
+    ghost: Vec<bool>,
+}
+
+impl Graph {
+    fn add_edge(&mut self, from: usize, to: usize, gain: Gain, status: EdgeStatus) {
+        self.inputs[to].push(InEdge {
+            src: from,
+            gain,
+            status,
+        });
+        self.outputs[from].push(to);
+    }
+}
+
+fn validate(spec: &GraphSpec, tables: &Tables) -> Result<Graph, GraphError> {
     let in_range = |kind, id: u32, capacity: usize| match (id as usize) < capacity {
         true => Ok(()),
         false => Err(GraphError::IdOutOfRange { kind, id, capacity }),
@@ -118,9 +274,9 @@ fn validate<'a>(spec: &'a GraphSpec, tables: &Tables) -> Result<Graph<'a>, Graph
         }
     }
 
-    let mut params = HashMap::new();
+    let mut params = HashSet::new();
     for p in &spec.params {
-        if params.insert(p.id, p.value).is_some() {
+        if !params.insert(p.id) {
             return Err(GraphError::DuplicateParam(p.id));
         }
         in_range("param", p.id.0, tables.params.capacity())?;
@@ -130,7 +286,14 @@ fn validate<'a>(spec: &'a GraphSpec, tables: &Tables) -> Result<Graph<'a>, Graph
     }
 
     let n = spec.nodes.len();
-    let (mut inputs, mut outputs) = (vec![Vec::new(); n], vec![Vec::new(); n]);
+    let mut g = Graph {
+        nodes: spec.nodes.clone(),
+        inputs: vec![Vec::new(); n],
+        outputs: vec![Vec::new(); n],
+        master: None,
+        meters: vec![Vec::new(); n],
+        ghost: vec![false; n],
+    };
     let mut seen = HashSet::new();
     for (e, &EdgeSpec { from, to, gain }) in spec.edges.iter().enumerate() {
         let lookup = |node: NodeId| {
@@ -151,14 +314,13 @@ fn validate<'a>(spec: &'a GraphSpec, tables: &Tables) -> Result<Graph<'a>, Graph
         }
         let gain = match gain {
             None => Gain::Unity,
-            Some(p) if params.contains_key(&p) => Gain::Param(p),
+            Some(p) if params.contains(&p) => Gain::Param(p),
             Some(p) => return Err(GraphError::UnknownParam { edge: e, param: p }),
         };
-        inputs[t].push((f, gain));
-        outputs[f].push(t);
+        g.add_edge(f, t, gain, EdgeStatus::Steady);
     }
 
-    let master = match spec.master {
+    g.master = match spec.master {
         None => None,
         Some(m) => match index.get(&m) {
             Some(&i) if matches!(spec.nodes[i].kind, NodeKind::DeviceOutput { .. }) => Some(i),
@@ -166,7 +328,6 @@ fn validate<'a>(spec: &'a GraphSpec, tables: &Tables) -> Result<Graph<'a>, Graph
         },
     };
 
-    let mut meters = vec![Vec::new(); n];
     let mut meter_ids = HashSet::new();
     for m in &spec.meters {
         if !meter_ids.insert(m.id) {
@@ -177,26 +338,90 @@ fn validate<'a>(spec: &'a GraphSpec, tables: &Tables) -> Result<Graph<'a>, Graph
             meter: m.id,
             node: m.node,
         })?;
-        meters[i].push(m.id);
+        g.meters[i].push(m.id);
     }
-    Ok(Graph {
-        spec,
-        inputs,
-        outputs,
-        master,
-        meters,
-    })
+    Ok(g)
+}
+
+/// Mark edge statuses relative to `prev`, and (with `ghosts`) add what disappeared as ghosts.
+///
+/// - An edge that was steady and whose two nodes are unchanged stays steady.
+/// - Any other edge in the spec fades in (continuing from wherever an inherited fade is).
+/// - An edge of `prev` missing from the spec fades out, together with any missing node it
+///   needs. A node that changed kind (or device) under the same id is replaced, not ghosted.
+///   The old master sink has no ring to keep feeding, so it isn't ghosted either.
+fn transition(g: &mut Graph, prev: &Layout, ghosts: bool) {
+    let prev_kind: HashMap<NodeId, &NodeKind> = prev.nodes.iter().map(|n| (n.id, &n.kind)).collect();
+    let prev_edges: HashMap<EdgeKey, EdgeStatus> =
+        prev.edges.iter().map(|(e, s)| ((e.from, e.to, e.gain), *s)).collect();
+    let mut index: HashMap<NodeId, usize> = g.nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
+    let unchanged = |g: &Graph, i: usize| prev_kind.get(&g.nodes[i].id) == Some(&&g.nodes[i].kind);
+
+    for t in 0..g.nodes.len() {
+        for k in 0..g.inputs[t].len() {
+            let src = g.inputs[t][k].src;
+            let key = (g.nodes[src].id, g.nodes[t].id, param_of(g.inputs[t][k].gain));
+            let steady = prev_edges.get(&key) == Some(&EdgeStatus::Steady) && unchanged(g, src) && unchanged(g, t);
+            g.inputs[t][k].status = if steady {
+                EdgeStatus::Steady
+            } else {
+                EdgeStatus::FadingIn
+            };
+        }
+    }
+    if !ghosts {
+        return;
+    }
+
+    let current: HashSet<EdgeKey> = (0..g.nodes.len())
+        .flat_map(|t| g.inputs[t].iter().map(move |e| (e.src, t, e.gain)))
+        .map(|(s, t, gain)| (g.nodes[s].id, g.nodes[t].id, param_of(gain)))
+        .collect();
+    let ghostable = |id: NodeId| match prev_kind.get(&id) {
+        Some(NodeKind::DeviceOutput { .. }) => prev.outputs.iter().any(|o| o.node == id),
+        Some(_) => true,
+        None => false,
+    };
+    for (edge, _) in &prev.edges {
+        if current.contains(&(edge.from, edge.to, edge.gain)) {
+            continue;
+        }
+        // Each end must be the same node it was, or a node that's gone and can be ghosted.
+        let usable = |id: NodeId| match index.get(&id) {
+            Some(&i) => unchanged(g, i),
+            None => ghostable(id),
+        };
+        if !(usable(edge.from) && usable(edge.to)) {
+            continue;
+        }
+        let mut node = |id: NodeId, g: &mut Graph| match index.get(&id) {
+            Some(&i) => i,
+            None => {
+                let kind = (*prev_kind[&id]).clone();
+                g.nodes.push(NodeSpec { id, kind });
+                g.inputs.push(Vec::new());
+                g.outputs.push(Vec::new());
+                g.meters.push(Vec::new());
+                g.ghost.push(true);
+                index.insert(id, g.nodes.len() - 1);
+                g.nodes.len() - 1
+            }
+        };
+        let (f, t) = (node(edge.from, g), node(edge.to, g));
+        let gain = edge.gain.map_or(Gain::Unity, Gain::Param);
+        g.add_edge(f, t, gain, EdgeStatus::FadingOut);
+    }
 }
 
 /// Nodes from which some sink or some metered node is reachable.
 fn live_nodes(g: &Graph) -> Vec<bool> {
-    let mut live = vec![false; g.spec.nodes.len()];
+    let mut live = vec![false; g.nodes.len()];
     let mut stack: Vec<usize> = (0..live.len())
-        .filter(|&i| g.spec.nodes[i].kind.is_sink() || !g.meters[i].is_empty())
+        .filter(|&i| g.nodes[i].kind.is_sink() || !g.meters[i].is_empty())
         .collect();
     while let Some(i) = stack.pop() {
         if !std::mem::replace(&mut live[i], true) {
-            stack.extend(g.inputs[i].iter().map(|&(src, _)| src));
+            stack.extend(g.inputs[i].iter().map(|e| e.src));
         }
     }
     live
@@ -204,7 +429,7 @@ fn live_nodes(g: &Graph) -> Vec<bool> {
 
 /// Kahn's algorithm over the whole graph (so cycles among dead nodes are still errors).
 fn topo_order(g: &Graph) -> Result<Vec<usize>, GraphError> {
-    let n = g.spec.nodes.len();
+    let n = g.nodes.len();
     let mut indegree: Vec<usize> = g.inputs.iter().map(Vec::len).collect();
     let mut ready: BinaryHeap<Reverse<usize>> = (0..n).filter(|&i| indegree[i] == 0).map(Reverse).collect();
     let mut order = Vec::with_capacity(n);
@@ -226,11 +451,11 @@ fn topo_order(g: &Graph) -> Result<Vec<usize>, GraphError> {
         let last = *path.last().unwrap_or(&0);
         let prev = g.inputs[last]
             .iter()
-            .map(|&(s, _)| s)
+            .map(|e| e.src)
             .find(|&s| indegree[s] > 0)
             .unwrap_or(last);
         if let Some(pos) = path.iter().position(|&p| p == prev) {
-            let mut cycle: Vec<NodeId> = path[pos..].iter().rev().map(|&i| g.spec.nodes[i].id).collect();
+            let mut cycle: Vec<NodeId> = path[pos..].iter().rev().map(|&i| g.nodes[i].id).collect();
             cycle.rotate_right(1); // start at `prev`, then follow edges forward
             return Err(GraphError::Cycle(cycle));
         }
@@ -265,6 +490,38 @@ impl Buffers {
     }
 }
 
+/// Where each piece of state lives in the running plan, by key.
+struct Inherit<'a> {
+    kind: HashMap<NodeId, &'a NodeKind>,
+    inputs: HashMap<NodeId, (usize, &'a Endpoint)>,
+    outputs: HashMap<NodeId, (usize, &'a Endpoint)>,
+    oscs: HashMap<NodeId, usize>,
+    smoothers: HashMap<EdgeKey, usize>,
+    fades: HashMap<EdgeKey, usize>,
+    rms: HashMap<(MeterId, NodeId), usize>,
+}
+
+impl<'a> Inherit<'a> {
+    fn new(prev: &'a Layout) -> Self {
+        let slots = |v: &'a [Endpoint]| v.iter().enumerate().map(|(i, e)| (e.node, (i, e))).collect();
+        Self {
+            kind: prev.nodes.iter().map(|n| (n.id, &n.kind)).collect(),
+            inputs: slots(&prev.inputs),
+            outputs: slots(&prev.outputs),
+            oscs: prev.oscs.iter().enumerate().map(|(i, n)| (*n, i)).collect(),
+            smoothers: prev.smoothers.iter().enumerate().map(|(i, k)| (*k, i)).collect(),
+            fades: prev.fades.iter().enumerate().map(|(i, k)| (*k, i)).collect(),
+            rms: prev.rms.iter().enumerate().map(|(i, k)| (*k, i)).collect(),
+        }
+    }
+
+    /// Same node, same kind: its state carries over.
+    fn unchanged(&self, node: &NodeSpec) -> bool {
+        self.kind.get(&node.id) == Some(&&node.kind)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit(
     g: &Graph,
     order: &[usize],
@@ -272,23 +529,22 @@ fn emit(
     block: usize,
     tables: &Tables,
     endpoints: &mut impl Endpoints,
+    prev: &Layout,
+    wait_for_fades: bool,
+    opened: &mut Vec<EndpointKey>,
 ) -> Result<Compiled, GraphError> {
+    let prev = Inherit::new(prev);
     let mut b = PlanBuilder::with_tables(block, tables.params.clone(), tables.meters.clone());
     let mut bufs = Buffers {
         pending_reads: Vec::new(),
         free: Vec::new(),
     };
-    let mut value: Vec<Option<BufId>> = vec![None; g.spec.nodes.len()];
-    let mut out = Compiled {
-        plan: PlanBuilder::new(block).build(), // replaced below
-        master_device: None,
-        order: Vec::new(),
-        input_stats: Vec::new(),
-        output_stats: Vec::new(),
-    };
+    let mut value: Vec<Option<BufId>> = vec![None; g.nodes.len()];
+    let mut layout = Layout::default();
 
     for &i in order.iter().filter(|&&i| live[i]) {
-        let node = &g.spec.nodes[i];
+        let node = &g.nodes[i];
+        let same = prev.unchanged(node);
         let endpoint_err = |reason| GraphError::Endpoint { node: node.id, reason };
         // A live node's buffer is read once per live outgoing edge, once per meter, and once
         // more by a sink's own op.
@@ -297,14 +553,33 @@ fn emit(
 
         let buf = match &node.kind {
             NodeKind::DeviceInput { device } => {
-                let (ring, stats) = b.input(endpoints.input(node.id, device).map_err(endpoint_err)?);
-                out.input_stats.push((node.id, stats));
+                let ring = match prev.inputs.get(&node.id).filter(|_| same) {
+                    Some(&(slot, ep)) => {
+                        layout.inputs.push(ep.clone());
+                        b.inherit_input(slot)
+                    }
+                    None => {
+                        let (reader, key) = endpoints.input(node.id, device).map_err(endpoint_err)?;
+                        opened.push(key);
+                        let (ring, stats) = b.input(reader);
+                        layout.inputs.push(Endpoint {
+                            node: node.id,
+                            key,
+                            stats,
+                        });
+                        ring
+                    }
+                };
                 let dst = bufs.alloc(&mut b);
                 b.op(Op::Pull { ring, dst });
                 dst
             }
             NodeKind::Tone { freq, gain } => {
-                let osc = b.oscillator();
+                let osc = match prev.oscs.get(&node.id).filter(|_| same) {
+                    Some(&slot) => b.inherit_oscillator(slot),
+                    None => b.oscillator(),
+                };
+                layout.oscs.push(node.id);
                 let dst = bufs.alloc(&mut b);
                 b.op(Op::Sine {
                     osc,
@@ -317,7 +592,13 @@ fn emit(
             NodeKind::Bus | NodeKind::DeviceOutput { .. } => match g.inputs[i].as_slice() {
                 // Forward: same buffer, no ops. Its reads are added before ours is consumed,
                 // so it can't be freed in between.
-                &[(src, Gain::Unity)] => {
+                &[
+                    InEdge {
+                        src,
+                        gain: Gain::Unity,
+                        status: EdgeStatus::Steady,
+                    },
+                ] => {
                     let shared = value[src].expect("inputs come first in topological order");
                     bufs.add_reads(shared, reads);
                     bufs.read(shared);
@@ -328,16 +609,46 @@ fn emit(
                     // Allocated before any input is released, so dst never aliases a source.
                     let dst = bufs.alloc(&mut b);
                     b.op(Op::Clear { dst });
-                    for &(src, gain) in inputs {
-                        let src_buf = value[src].expect("inputs come first in topological order");
-                        let gain = match gain {
+                    for e in inputs {
+                        let src_buf = value[e.src].expect("inputs come first in topological order");
+                        let key = (g.nodes[e.src].id, node.id, param_of(e.gain));
+                        let gain = match e.gain {
                             Gain::Unity => plan::Gain::Fixed(1.0),
-                            Gain::Param(id) => b.param_gain(id),
+                            Gain::Param(p) => {
+                                layout.smoothers.push(key);
+                                match prev.smoothers.get(&key) {
+                                    Some(&slot) => b.inherit_param_gain(p, slot),
+                                    None => b.param_gain(p),
+                                }
+                            }
                         };
+                        let fade = match e.status {
+                            EdgeStatus::Steady => None,
+                            status => {
+                                let (start, target) = match status {
+                                    EdgeStatus::FadingOut => (1.0, 0.0),
+                                    _ => (0.0, 1.0),
+                                };
+                                layout.fades.push(key);
+                                Some(match prev.fades.get(&key) {
+                                    Some(&slot) => b.inherit_fade(slot, target),
+                                    None => b.fade(start, target),
+                                })
+                            }
+                        };
+                        layout.edges.push((
+                            EdgeSpec {
+                                from: key.0,
+                                to: key.1,
+                                gain: key.2,
+                            },
+                            e.status,
+                        ));
                         b.op(Op::MixAdd {
                             src: src_buf,
                             dst,
                             gain,
+                            fade,
                         });
                         bufs.read(src_buf);
                     }
@@ -348,9 +659,21 @@ fn emit(
         if value[i].is_none() {
             bufs.add_reads(buf, reads);
             value[i] = Some(buf);
+        } else if let [e] = g.inputs[i].as_slice() {
+            // Forwarded edge: still part of the layout.
+            let key = (g.nodes[e.src].id, node.id);
+            layout.edges.push((
+                EdgeSpec {
+                    from: key.0,
+                    to: key.1,
+                    gain: None,
+                },
+                e.status,
+            ));
         }
         for &meter in &g.meters[i] {
-            b.meter(buf, meter);
+            layout.rms.push((meter, node.id));
+            b.meter(buf, meter, prev.rms.get(&(meter, node.id)).copied());
             bufs.read(buf);
         }
 
@@ -359,101 +682,58 @@ fn emit(
                 // `Master` only names the bus; the clock reads it after the whole block, so its
                 // read stays pending and the buffer is never handed to a later node.
                 b.op(Op::Master { src: buf });
-                out.master_device = Some(device.clone());
+                layout.master_device = Some(device.clone());
             } else {
-                let (ring, stats) = b.output(endpoints.output(node.id, device).map_err(endpoint_err)?);
-                out.output_stats.push((node.id, stats));
+                let ring = match prev.outputs.get(&node.id).filter(|_| same) {
+                    Some(&(slot, ep)) => {
+                        layout.outputs.push(ep.clone());
+                        b.inherit_output(slot)
+                    }
+                    None => {
+                        let (writer, key) = endpoints.output(node.id, device).map_err(endpoint_err)?;
+                        opened.push(key);
+                        let (ring, stats) = b.output(writer);
+                        layout.outputs.push(Endpoint {
+                            node: node.id,
+                            key,
+                            stats,
+                        });
+                        ring
+                    }
+                };
                 b.op(Op::Push { src: buf, ring });
                 bufs.read(buf);
             }
         }
-        out.order.push(node.id);
+        layout.nodes.push(node.clone());
+        layout.ghosts += g.ghost[i] as usize;
     }
 
-    out.plan = b.build();
-    Ok(out)
+    b.master_device(layout.master_device.clone())
+        .wait_for_fades(wait_for_fades);
+    Ok(Compiled {
+        plan: b.build(),
+        layout,
+    })
+}
+
+fn param_of(gain: Gain) -> Option<ParamId> {
+    match gain {
+        Gain::Unity => None,
+        Gain::Param(p) => Some(p),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Frame;
-    use crate::graph::spec::{MeterSpec, NodeSpec, ParamId, ParamSpec};
+    use crate::graph::spec::MeterSpec;
     use crate::rt::offline;
     use crate::rt::params::RAMP_FRAMES;
-    use crate::rt::ring::ring;
-    use rtrb::{Consumer, Producer};
+    use crate::testing::*;
 
-    /// Hands out rings and keeps the device ends: producers for inputs, consumers for outputs.
-    #[derive(Default)]
-    struct FakeEndpoints {
-        inputs: Vec<(NodeId, Producer<Frame>)>,
-        outputs: Vec<(NodeId, Consumer<Frame>)>,
-        opened: Vec<String>,
-        fail: Option<String>,
-    }
-
-    impl Endpoints for FakeEndpoints {
-        fn input(&mut self, node: NodeId, device: &str) -> Result<RingReader, String> {
-            if self.fail.as_deref() == Some(device) {
-                return Err(format!("{device} not found"));
-            }
-            self.opened.push(device.into());
-            let (p, c) = rtrb::RingBuffer::new(4096);
-            self.inputs.push((node, p));
-            Ok(RingReader::new(c, 0, 4096))
-        }
-        fn output(&mut self, node: NodeId, device: &str) -> Result<RingWriter, String> {
-            self.opened.push(device.into());
-            let (w, c) = ring(1 << 16);
-            self.outputs.push((node, c));
-            Ok(w)
-        }
-    }
-
-    impl FakeEndpoints {
-        fn feed(&mut self, node: u32, frames: &[Frame]) {
-            let p = &mut self.inputs.iter_mut().find(|(n, _)| n.0 == node).unwrap().1;
-            frames.iter().for_each(|f| p.push(*f).unwrap());
-        }
-        fn drain(&mut self, node: u32) -> Vec<Frame> {
-            let c = &mut self.outputs.iter_mut().find(|(n, _)| n.0 == node).unwrap().1;
-            std::iter::from_fn(|| c.pop().ok()).collect()
-        }
-    }
-
-    // ---- spec helpers ----
-    fn node(id: u32, kind: NodeKind) -> NodeSpec {
-        NodeSpec { id: NodeId(id), kind }
-    }
-    fn tone(id: u32, freq: f32, gain: f32) -> NodeSpec {
-        node(id, NodeKind::Tone { freq, gain })
-    }
-    fn input(id: u32, dev: &str) -> NodeSpec {
-        node(id, NodeKind::DeviceInput { device: dev.into() })
-    }
-    fn bus(id: u32) -> NodeSpec {
-        node(id, NodeKind::Bus)
-    }
-    fn output(id: u32, dev: &str) -> NodeSpec {
-        node(id, NodeKind::DeviceOutput { device: dev.into() })
-    }
-    fn edge(from: u32, to: u32) -> EdgeSpec {
-        EdgeSpec {
-            from: NodeId(from),
-            to: NodeId(to),
-            gain: None,
-        }
-    }
-    fn gain_edge(from: u32, to: u32, param: u32) -> EdgeSpec {
-        EdgeSpec {
-            from: NodeId(from),
-            to: NodeId(to),
-            gain: Some(ParamId(param)),
-        }
-    }
-    fn param(id: u32, value: f32) -> ParamSpec {
-        ParamSpec { id: ParamId(id), value }
+    fn order(c: &Compiled) -> Vec<NodeId> {
+        c.layout.nodes().iter().map(|n| n.id).collect()
     }
 
     fn compile_ok(spec: &GraphSpec) -> (Compiled, FakeEndpoints) {
@@ -467,10 +747,6 @@ mod tests {
             Ok(_) => panic!("expected an error"),
             Err(e) => e,
         }
-    }
-
-    fn sine_at(i: usize, freq: f32, gain: f32) -> f32 {
-        (i as f64 * freq as f64 / crate::SAMPLE_RATE as f64 * std::f64::consts::TAU).sin() as f32 * gain
     }
 
     // ---- emission ----
@@ -489,7 +765,7 @@ mod tests {
             "{:?}",
             c.plan.ops()
         );
-        assert_eq!(c.master_device.as_deref(), Some("spk"));
+        assert_eq!(c.plan.master_device(), Some("spk"));
         let out = offline::render(&mut c.plan, 3);
         for (i, f) in out.iter().enumerate() {
             assert!((f[0] - sine_at(i, 1000.0, 0.5)).abs() < 1e-4);
@@ -579,7 +855,7 @@ mod tests {
             ..Default::default()
         };
         let (mut c, mut ep) = compile_ok(&spec);
-        assert_eq!(c.master_device, None);
+        assert_eq!(c.plan.master_device(), None);
         assert!(
             offline::render(&mut c.plan, 2).iter().all(|f| *f == [0.0; 2]),
             "master bus is silent"
@@ -596,7 +872,7 @@ mod tests {
             ..Default::default()
         };
         let (c, ep) = compile_ok(&spec);
-        assert_eq!(c.order, vec![NodeId(3), NodeId(4)]);
+        assert_eq!(order(&c), vec![NodeId(3), NodeId(4)]);
         assert!(ep.opened.is_empty(), "opened {:?}", ep.opened);
     }
 
@@ -638,9 +914,9 @@ mod tests {
             master: Some(NodeId(9)),
             ..Default::default()
         };
-        let a = compile_ok(&spec).0.order;
+        let a = order(&compile_ok(&spec).0);
         assert_eq!(a, vec![NodeId(2), NodeId(1), NodeId(5), NodeId(9)]);
-        assert_eq!(compile_ok(&spec).0.order, a);
+        assert_eq!(order(&compile_ok(&spec).0), a);
     }
 
     // ---- params and meters (E4) ----
@@ -937,20 +1213,6 @@ mod tests {
     }
 
     // ---- randomized: compiled output == direct evaluation ----
-
-    /// Tiny deterministic PRNG (xorshift), so the test needs no dependencies.
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
-    }
 
     /// Random DAG: tones, then buses, then outputs; edges only go "forward", so no cycles.
     fn random_spec(rng: &mut Rng) -> GraphSpec {

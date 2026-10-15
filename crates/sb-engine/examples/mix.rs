@@ -1,8 +1,8 @@
-//! Milestones E2–E4: a `GraphSpec`, compiled to a render plan, run by the mix thread, with
-//! live params and meters.
+//! Milestones E2–E5: the engine running a `GraphSpec` on the mix thread, with live params,
+//! meters, and glitch-free graph updates.
 //!
 //!   mix [--in NAME|none] [--out NAME|timer] [--out2 NAME] [--tone HZ] [--tone-gain G]
-//!       [--mic-gain G] [--pulse] [--block FRAMES] [--seconds N]
+//!       [--mic-gain G] [--pulse] [--reroute] [--block FRAMES] [--seconds N]
 //!
 //! Graph: mic and a test tone feed a bus; the bus feeds the `--out` device (the master: its
 //! event clocks the mix and the mix writes it directly) and optionally `--out2` (through a
@@ -10,8 +10,10 @@
 //! Device NAME: part of the name or the full ID; omitted means the default device.
 //!
 //! The tone reaches the bus through a param edge; `--pulse` switches that param between 1
-//! and 0 every second while running (smoothed, no clicks). Each status line shows the mic
-//! and bus meters in dBFS.
+//! and 0 every second while running (smoothed, no clicks). `--reroute` applies a new graph
+//! every 2 seconds, swapping the tone for a different tone node (a 5 ms crossfade); the mic
+//! stays connected and its device is never reopened. Each status line shows the mic and bus
+//! meters in dBFS, and how many plans the mix thread has adopted.
 
 #[cfg(not(windows))]
 fn main() {
@@ -29,18 +31,20 @@ fn main() {
 
 #[cfg(windows)]
 mod win {
-    use sb_engine::backend::wasapi::{self, ComGuard, Direction, WasapiEndpoints};
+    use sb_engine::backend::wasapi::{self, ComGuard, DeviceInfo, Direction};
+    use sb_engine::engine::start_wasapi;
     use sb_engine::frames_to_ms;
-    use sb_engine::graph::compile::{Tables, compile};
+    use sb_engine::graph::compile::Tables;
     use sb_engine::graph::spec::{
         EdgeSpec, GraphSpec, MeterId, MeterSpec, NodeId, NodeKind, NodeSpec, ParamId, ParamSpec,
     };
     use sb_engine::rt::meters::to_db;
-    use sb_engine::rt::mix_thread;
     use sb_engine::rt::stats::MixSnapshot;
     use std::time::{Duration, Instant};
 
     const TONE: NodeId = NodeId(1);
+    /// The other tone `--reroute` switches to (a different node, a fifth higher).
+    const TONE_ALT: NodeId = NodeId(6);
     const BUS: NodeId = NodeId(2);
     const MIC: NodeId = NodeId(3);
     const OUT: NodeId = NodeId(4);
@@ -62,6 +66,7 @@ mod win {
         block: usize,
         seconds: Option<u64>,
         pulse: bool,
+        reroute: bool,
     }
 
     fn parse_args() -> Result<Args, String> {
@@ -77,6 +82,7 @@ mod win {
             block: 256,
             seconds: None,
             pulse: false,
+            reroute: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -100,10 +106,11 @@ mod win {
                 "--block" => a.block = num(&arg, value()?)?,
                 "--seconds" => a.seconds = Some(num(&arg, value()?)?),
                 "--pulse" => a.pulse = true,
+                "--reroute" => a.reroute = true,
                 "-h" | "--help" => {
                     println!(
                         "usage: mix [--in NAME|none] [--out NAME|timer] [--out2 NAME] [--tone HZ] [--tone-gain G] \
-                         [--mic-gain G] [--pulse] [--block FRAMES] [--seconds N]"
+                         [--mic-gain G] [--pulse] [--reroute] [--block FRAMES] [--seconds N]"
                     );
                     std::process::exit(0);
                 }
@@ -116,51 +123,57 @@ mod win {
         Ok(a)
     }
 
-    pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-        let args = parse_args()?;
-        let _com = ComGuard::new()?;
+    struct Devices {
+        mic: Option<DeviceInfo>,
+        out: Option<DeviceInfo>,
+        out2: Option<DeviceInfo>,
+    }
 
+    /// The demo graph. `alt` uses the other tone node (for `--reroute`).
+    fn build_spec(args: &Args, dev: &Devices, alt: bool) -> GraphSpec {
         let mut spec = GraphSpec::default();
-        let mut add = |id, kind| spec.nodes.push(NodeSpec { id, kind });
-        let mic = match args.no_input {
-            true => None,
-            false => Some(wasapi::find_device(Direction::Capture, args.input.as_deref())?),
+        let (tone, freq) = if alt {
+            (TONE_ALT, args.tone * 1.5)
+        } else {
+            (TONE, args.tone)
         };
-        let out = match args.timer {
-            true => None,
-            false => Some(wasapi::find_device(Direction::Render, args.output.as_deref())?),
-        };
-        let out2 = args
-            .output2
-            .as_deref()
-            .map(|n| wasapi::find_device(Direction::Render, Some(n)))
-            .transpose()?;
-
-        add(
-            TONE,
-            NodeKind::Tone {
-                freq: args.tone,
+        spec.nodes.push(NodeSpec {
+            id: tone,
+            kind: NodeKind::Tone {
+                freq,
                 gain: args.tone_gain,
             },
-        );
-        add(BUS, NodeKind::Bus);
-        let mut edges = vec![(TONE, BUS, Some(TONE_ON))];
-        if let Some(d) = &mic {
-            add(MIC, NodeKind::DeviceInput { device: d.id.clone() });
+        });
+        spec.nodes.push(NodeSpec {
+            id: BUS,
+            kind: NodeKind::Bus,
+        });
+        let mut edges = vec![(tone, BUS, Some(TONE_ON))];
+        if let Some(d) = &dev.mic {
+            spec.nodes.push(NodeSpec {
+                id: MIC,
+                kind: NodeKind::DeviceInput { device: d.id.clone() },
+            });
             edges.push((MIC, BUS, Some(MIC_GAIN)));
-            println!("in:     {}", d.name);
+            spec.meters.push(MeterSpec {
+                id: MIC_METER,
+                node: MIC,
+            });
         }
-        if let Some(d) = &out {
-            add(OUT, NodeKind::DeviceOutput { device: d.id.clone() });
+        if let Some(d) = &dev.out {
+            spec.nodes.push(NodeSpec {
+                id: OUT,
+                kind: NodeKind::DeviceOutput { device: d.id.clone() },
+            });
             edges.push((BUS, OUT, None));
-            println!("master: {}", d.name);
-        } else {
-            println!("master: timer clock");
+            spec.master = Some(OUT);
         }
-        if let Some(d) = &out2 {
-            add(OUT2, NodeKind::DeviceOutput { device: d.id.clone() });
+        if let Some(d) = &dev.out2 {
+            spec.nodes.push(NodeSpec {
+                id: OUT2,
+                kind: NodeKind::DeviceOutput { device: d.id.clone() },
+            });
             edges.push((BUS, OUT2, None));
-            println!("out2:   {}", d.name);
         }
         spec.edges = edges
             .into_iter()
@@ -176,41 +189,36 @@ mod win {
                 value: 1.0,
             },
         ];
-        spec.meters = vec![MeterSpec {
+        spec.meters.push(MeterSpec {
             id: BUS_METER,
             node: BUS,
-        }];
-        if mic.is_some() {
-            spec.meters.push(MeterSpec {
-                id: MIC_METER,
-                node: MIC,
-            });
-        }
-        spec.master = out.as_ref().map(|_| OUT);
+        });
+        spec
+    }
 
-        let mut endpoints = WasapiEndpoints::new(args.block, out.as_ref().map(|d| d.id.as_str()))?;
-        let tables = Tables::new(16, 16);
-        let compiled = compile(&spec, args.block, &tables, &mut endpoints)?;
-        let plan = &compiled.plan;
-        println!(
-            "plan: {} ops, {} buffers, {} frames ({:.2} ms) per block",
-            plan.ops().len(),
-            plan.buffer_count(),
-            plan.block(),
-            frames_to_ms(plan.block())
-        );
-        for op in plan.ops() {
-            println!("  {op:?}");
+    pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+        let args = parse_args()?;
+        let _com = ComGuard::new()?;
+        let dev = Devices {
+            mic: (!args.no_input)
+                .then(|| wasapi::find_device(Direction::Capture, args.input.as_deref()))
+                .transpose()?,
+            out: (!args.timer)
+                .then(|| wasapi::find_device(Direction::Render, args.output.as_deref()))
+                .transpose()?,
+            out2: args
+                .output2
+                .as_deref()
+                .map(|n| wasapi::find_device(Direction::Render, Some(n)))
+                .transpose()?,
+        };
+        for (label, d) in [("in", &dev.mic), ("master", &dev.out), ("out2", &dev.out2)] {
+            println!("{label:>6}: {}", d.as_ref().map_or("—".into(), |d| d.name.clone()));
         }
 
-        let mix = mix_thread::spawn(compiled.plan, compiled.master_device.as_deref())?;
-        if let Some(d) = mix.master.device {
-            println!(
-                "master device: period {:.1} ms, buffer {:.1} ms",
-                frames_to_ms(d.period_frames),
-                frames_to_ms(d.buffer_frames)
-            );
-        }
+        let (mut engine, mix) = start_wasapi(args.block, Tables::new(16, 16))?;
+        let mut alt = false;
+        engine.apply_graph(&build_spec(&args, &dev, alt))?;
         println!(
             "mix thread MMCSS {}",
             if mix.stats.snapshot().mmcss { "on" } else { "OFF" }
@@ -218,13 +226,25 @@ mod win {
 
         let start = Instant::now();
         let mut last = MixSnapshot::default();
+        let mut second = 0;
         loop {
-            std::thread::sleep(Duration::from_secs(1));
+            // maintain() often: it retires plans and queues settle plans after fades.
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(50));
+                engine.maintain();
+            }
+            second += 1;
+            if second == 1 {
+                // The first plan has settled by now: show what's running.
+                for (i, n) in engine.running_layout().nodes().iter().enumerate() {
+                    println!("  node {i}: {} {:?}", n.id.0, n.kind);
+                }
+            }
             let m = mix.stats.snapshot();
             let blocks = m.blocks - last.blocks;
             let budget_ns = blocks as f64 * frames_to_ms(args.block) * 1e6;
             print!(
-                "{:>5.0}s  mix {:>4} blk/s load {:>5.2}% max {:>6.1} us late {:<3}{}",
+                "{:>5.0}s  mix {:>4} blk/s load {:>5.2}% max {:>6.1} us late {:<3} plans {:<3}{}",
                 start.elapsed().as_secs_f64(),
                 blocks,
                 if budget_ns > 0.0 {
@@ -234,10 +254,11 @@ mod win {
                 },
                 m.max_block_ns as f64 / 1000.0,
                 m.late_blocks,
+                m.swaps,
                 if m.master_fallback { " MASTER LOST→timer" } else { "" },
             );
-            for (_, s) in &compiled.input_stats {
-                let r = s.snapshot();
+            for ep in engine.running_layout().inputs() {
+                let r = ep.stats.snapshot();
                 print!(
                     " | mic ring underruns {:<3} trimmed {:<6} fill {:>5.1} ms",
                     r.xruns,
@@ -245,77 +266,65 @@ mod win {
                     frames_to_ms(r.ring_fill as usize)
                 );
             }
-            for (node, stream) in endpoints.streams.iter().filter(|(n, _)| *n == OUT2) {
-                let s = stream.stats.snapshot();
-                print!(
-                    " | out2 {} underruns {:<3} fill {:>5.1} ms",
-                    node.0,
-                    s.xruns,
-                    frames_to_ms(s.ring_fill as usize)
-                );
-            }
             let db = |v: f32| format!("{:>6.1}", to_db(v));
-            if let Some(r) = tables.meters.read(BUS_METER) {
+            if let Some(r) = engine.tables().meters.read(BUS_METER) {
                 print!(
                     " | bus pk {} rms {} dB",
                     db(r.peak[0].max(r.peak[1])),
                     db(r.rms[0].max(r.rms[1]))
                 );
             }
-            if mic.is_some()
-                && let Some(r) = tables.meters.read(MIC_METER)
+            if dev.mic.is_some()
+                && let Some(r) = engine.tables().meters.read(MIC_METER)
             {
                 print!(" | mic pk {} dB", db(r.peak[0].max(r.peak[1])));
             }
-            println!();
+            println!(" | streams open {}", engine.endpoints().streams.len());
             last = m;
-            if args.pulse {
-                let on = start.elapsed().as_secs() % 2 == 0;
-                tables.params.set(TONE_ON, if on { 1.0 } else { 0.0 });
-            }
 
-            let ended = mix.is_finished() || endpoints.streams.iter().any(|(_, s)| s.is_finished());
+            if args.pulse {
+                engine.set_param(TONE_ON, if second % 2 == 0 { 1.0 } else { 0.0 });
+            }
+            if args.reroute && second % 2 == 0 {
+                alt = !alt;
+                engine.apply_graph(&build_spec(&args, &dev, alt))?;
+            }
+            let ended = mix.is_finished() || engine.endpoints().streams.iter().any(|(_, _, s)| s.is_finished());
             if ended || args.seconds.is_some_and(|s| start.elapsed().as_secs() >= s) {
                 break;
             }
         }
 
         let m = mix.stats.snapshot();
-        let mut failed = false;
-        let mut report = |what: String, r: windows::core::Result<()>| {
-            let how = match r {
+        println!(
+            "mix: {} blocks, {} plans adopted, max block {:.1} us, {} late, master fallback {}",
+            m.blocks,
+            m.swaps,
+            m.max_block_ns as f64 / 1000.0,
+            m.late_blocks,
+            m.master_fallback
+        );
+        for ep in engine.running_layout().inputs() {
+            let r = ep.stats.snapshot();
+            println!(
+                "mic ring (mix side): {} underruns ({} frames), {} trimmed",
+                r.xruns, r.xrun_frames, r.trimmed_frames
+            );
+        }
+        let mut failed = mix.stop().map_err(|e| println!("mix thread FAILED: {e}")).is_err();
+        for (key, node, stream) in std::mem::take(&mut engine.endpoints_mut().streams) {
+            let s = stream.stats.snapshot();
+            let how = match stream.stop() {
                 Ok(()) => "ok".to_string(),
                 Err(e) => {
                     failed = true;
                     format!("FAILED: {e}")
                 }
             };
-            println!("{what} | {how}");
-        };
-        report(
-            format!(
-                "mix: {} blocks, max block {:.1} us, {} late, master fallback {}",
-                m.blocks,
-                m.max_block_ns as f64 / 1000.0,
-                m.late_blocks,
-                m.master_fallback
-            ),
-            mix.stop(),
-        );
-        for (_, s) in &compiled.input_stats {
-            let r = s.snapshot();
             println!(
-                "mic ring (mix side): {} underruns ({} frames), {} trimmed",
-                r.xruns, r.xrun_frames, r.trimmed_frames
-            );
-        }
-        for (node, stream) in endpoints.streams {
-            let s = stream.stats.snapshot();
-            let what = format!(
-                "node {} device thread: {} frames, {} xruns ({} frames), {} trimmed",
+                "endpoint {key} (node {}): {} frames, {} xruns ({} frames), {} trimmed | {how}",
                 node.0, s.frames, s.xruns, s.xrun_frames, s.trimmed_frames
             );
-            report(what, stream.stop());
         }
         if failed { Err("a thread failed".into()) } else { Ok(()) }
     }

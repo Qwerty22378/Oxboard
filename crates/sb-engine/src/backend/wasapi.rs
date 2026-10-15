@@ -8,7 +8,7 @@
 //! threads. Setup errors are reported back to the spawner before the stream starts; after
 //! that the thread runs until stopped or until the device disappears.
 
-use crate::graph::compile::Endpoints;
+use crate::graph::compile::{EndpointKey, Endpoints};
 use crate::graph::spec::NodeId;
 use crate::rt::ring::{RingReader, RingSizing, RingWriter};
 use crate::rt::stats::StreamStats;
@@ -270,45 +270,63 @@ fn hns_to_frames(hns: i64) -> usize {
 }
 
 /// [`Endpoints`] backed by WASAPI streams: binding a device node opens the device and starts
-/// its capture or render thread. Keep this alive as long as the plan runs.
+/// its capture or render thread; releasing it stops the thread. Must outlive the engine's
+/// plans (the `Engine` owns it).
 pub struct WasapiEndpoints {
+    block: usize,
     mix_burst: usize,
-    /// Device threads by node, in the order the compiler bound them.
-    pub streams: Vec<(NodeId, Stream)>,
+    next_key: EndpointKey,
+    /// Open device threads: (key, node, stream).
+    pub streams: Vec<(EndpointKey, NodeId, Stream)>,
 }
 
 impl WasapiEndpoints {
-    /// `master`: the master device's endpoint ID (sets how many frames the mix moves per
-    /// wake-up, which sizes every ring), or `None` for the timer clock.
-    pub fn new(block: usize, master: Option<&str>) -> Result<Self> {
-        let mix_burst = match master {
-            Some(id) => default_period_frames(id)?.div_ceil(block) * block,
-            None => block,
-        };
-        Ok(Self {
-            mix_burst,
+    /// Rings are sized for the timer clock until [`Endpoints::master_changed`] says otherwise.
+    pub fn new(block: usize) -> Self {
+        Self {
+            block,
+            mix_burst: block,
+            next_key: 0,
             streams: Vec::new(),
-        })
+        }
+    }
+
+    fn add(&mut self, node: NodeId, stream: Stream) -> EndpointKey {
+        self.next_key += 1;
+        self.streams.push((self.next_key, node, stream));
+        self.next_key
     }
 }
 
 impl Endpoints for WasapiEndpoints {
-    fn input(&mut self, node: NodeId, device: &str) -> std::result::Result<RingReader, String> {
-        let mut open = || -> Result<RingReader> {
+    fn input(&mut self, node: NodeId, device: &str) -> std::result::Result<(RingReader, EndpointKey), String> {
+        let mut open = || -> Result<(RingReader, EndpointKey)> {
             let (writer, reader) = RingSizing::for_bursts(default_period_frames(device)?, self.mix_burst).ring();
-            self.streams.push((node, spawn_capture(device, writer)?));
-            Ok(reader)
+            let stream = spawn_capture(device, writer)?;
+            Ok((reader, self.add(node, stream)))
         };
         open().map_err(|e| e.message())
     }
 
-    fn output(&mut self, node: NodeId, device: &str) -> std::result::Result<RingWriter, String> {
-        let mut open = || -> Result<RingWriter> {
+    fn output(&mut self, node: NodeId, device: &str) -> std::result::Result<(RingWriter, EndpointKey), String> {
+        let mut open = || -> Result<(RingWriter, EndpointKey)> {
             let (writer, reader) = RingSizing::for_bursts(self.mix_burst, default_period_frames(device)?).ring();
-            self.streams.push((node, spawn_render(device, reader)?));
-            Ok(writer)
+            let stream = spawn_render(device, reader)?;
+            Ok((writer, self.add(node, stream)))
         };
         open().map_err(|e| e.message())
+    }
+
+    fn release(&mut self, key: EndpointKey) {
+        // Dropping the stream stops its thread.
+        self.streams.retain(|(k, ..)| *k != key);
+    }
+
+    /// A device master renders its whole period as back-to-back blocks; the timer one block.
+    fn master_changed(&mut self, device: Option<&str>) {
+        self.mix_burst = device
+            .and_then(|id| default_period_frames(id).ok())
+            .map_or(self.block, |period| period.div_ceil(self.block) * self.block);
     }
 }
 

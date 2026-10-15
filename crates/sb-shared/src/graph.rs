@@ -130,6 +130,8 @@ pub enum GraphError {
         node: NodeId,
         reason: String,
     },
+    /// The engine's queue of pending plans is full (the mix thread isn't adopting them).
+    Busy,
 }
 
 impl fmt::Display for GraphError {
@@ -153,6 +155,7 @@ impl fmt::Display for GraphError {
             BadMaster(n) => write!(f, "master node {} is not a device output", n.0),
             InvalidValue(what) => write!(f, "invalid value: {what}"),
             Endpoint { node, reason } => write!(f, "node {}: {reason}", node.0),
+            Busy => write!(f, "engine busy: too many graph updates pending"),
         }
     }
 }

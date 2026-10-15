@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 /// Ramp length for every param change: 10 ms at 48 kHz.
 pub const RAMP_FRAMES: u32 = 480;
 
+/// Fade length when an edge appears or disappears: 5 ms at 48 kHz.
+pub const EDGE_FADE_FRAMES: u32 = 240;
+
 /// Param targets, allocated once. Ids index it directly, so the controller hands out dense ids.
 pub struct ParamTable {
     slots: Box<[AtomicU32]>,
@@ -49,22 +52,30 @@ impl ParamTable {
 }
 
 /// Linear ramp from the current value to the latest target. Owned by one op; lives in the plan.
+/// Also used for edge fades, with a shorter ramp.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Smoother {
     current: f32,
     target: f32,
     step: f32,
     remaining: u32,
+    ramp: u32,
 }
 
 impl Smoother {
     /// Start settled at `value`: a new plan continues from where the param is, without a fade.
     pub fn new(value: f32) -> Self {
+        Self::with_ramp(value, RAMP_FRAMES)
+    }
+
+    /// Settled at `value`, ramping over `ramp` frames on each retarget.
+    pub fn with_ramp(value: f32, ramp: u32) -> Self {
         Self {
             current: value,
             target: value,
             step: 0.0,
             remaining: 0,
+            ramp: ramp.max(1),
         }
     }
 
@@ -73,8 +84,8 @@ impl Smoother {
     pub fn set_target(&mut self, target: f32) {
         if target != self.target {
             self.target = target;
-            self.remaining = RAMP_FRAMES;
-            self.step = (target - self.current) / RAMP_FRAMES as f32;
+            self.remaining = self.ramp;
+            self.step = (target - self.current) / self.ramp as f32;
         }
     }
 
