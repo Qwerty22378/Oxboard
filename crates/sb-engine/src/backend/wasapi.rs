@@ -16,7 +16,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
@@ -69,32 +69,92 @@ pub struct StreamInfo {
 pub struct Stream {
     pub info: StreamInfo,
     pub stats: Arc<StreamStats>,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<Result<()>>>,
+    thread: RtThread,
 }
 
 impl Stream {
     /// True once the thread has exited (stopped, or the device failed).
     pub fn is_finished(&self) -> bool {
-        self.thread.as_ref().is_none_or(|t| t.is_finished())
+        self.thread.is_finished()
     }
 
     /// Stop the thread and return how it ended.
     pub fn stop(mut self) -> Result<()> {
-        self.join()
+        self.thread.join()
+    }
+}
+
+/// A real-time thread with COM initialized, a stop flag, and a join that reports how it ended.
+/// Dropping it stops the thread and waits for it.
+pub(crate) struct RtThread {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<Result<()>>>,
+}
+
+impl RtThread {
+    /// Spawn `name`: COM, then `setup` on the new thread, whose `R` (or error) is handed back
+    /// before `run` starts. `S` stays on the thread, so COM objects never cross threads.
+    pub(crate) fn spawn<S, R: Send + 'static>(
+        name: &str,
+        setup: impl FnOnce() -> Result<(S, R)> + Send + 'static,
+        run: impl FnOnce(S, &AtomicBool) -> Result<()> + Send + 'static,
+    ) -> Result<(Self, R)> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<R>>(1);
+        let thread = {
+            let stop = stop.clone();
+            std::thread::Builder::new()
+                .name(name.to_owned())
+                .spawn(move || -> Result<()> {
+                    let com = match ComGuard::new() {
+                        Ok(com) => com,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e.clone()));
+                            return Err(e);
+                        }
+                    };
+                    let state = match setup() {
+                        Ok((state, ready)) => {
+                            let _ = ready_tx.send(Ok(ready));
+                            state
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e.clone()));
+                            return Err(e);
+                        }
+                    };
+                    let result = run(state, &stop); // consumes `state`: COM objects go before `com`
+                    drop(com);
+                    result
+                })
+                .map_err(|e| Error::new(E_FAIL, e.to_string()))?
+        };
+        let me = Self {
+            stop,
+            thread: Some(thread),
+        };
+        match ready_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(ready)) => Ok((me, ready)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(Error::new(E_FAIL, format!("{name} thread didn't start"))),
+        }
     }
 
-    fn join(&mut self) -> Result<()> {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(|t| t.is_finished())
+    }
+
+    pub(crate) fn join(&mut self) -> Result<()> {
         self.stop.store(true, Relaxed);
         match self.thread.take().map(|t| t.join()) {
             Some(Ok(result)) => result,
-            Some(Err(_)) => Err(Error::new(windows::Win32::Foundation::E_FAIL, "audio thread panicked")),
+            Some(Err(_)) => Err(Error::new(E_FAIL, "audio thread panicked")),
             None => Ok(()),
         }
     }
 }
 
-impl Drop for Stream {
+impl Drop for RtThread {
     fn drop(&mut self) {
         let _ = self.join();
     }
@@ -125,7 +185,7 @@ fn device_id(device: &IMMDevice) -> Result<String> {
         let raw = device.GetId()?;
         let id = raw.to_string();
         CoTaskMemFree(Some(raw.0 as *const _));
-        id.map_err(|e| Error::new(windows::Win32::Foundation::E_FAIL, e.to_string()))
+        id.map_err(|e| Error::new(E_FAIL, e.to_string()))
     }
 }
 
@@ -209,74 +269,47 @@ fn hns_to_frames(hns: i64) -> usize {
 
 /// Start a capture thread that writes the device's audio into `writer`.
 pub fn spawn_capture(device_id: &str, writer: RingWriter) -> Result<Stream> {
-    spawn(device_id, Direction::Capture, move |client, info, stats, stop| {
-        capture_loop(client, info, writer, stats, stop)
+    spawn_stream(device_id, "sb-capture", move |client, stats, stop| {
+        capture_loop(client, writer, stats, stop)
     })
 }
 
 /// Start a render thread that plays what `reader` delivers.
 pub fn spawn_render(device_id: &str, reader: RingReader) -> Result<Stream> {
-    spawn(device_id, Direction::Render, move |client, info, stats, stop| {
-        render_loop(client, info, reader, stats, stop)
+    spawn_stream(device_id, "sb-render", move |client, stats, stop| {
+        render_loop(client, reader, stats, stop)
     })
 }
 
-fn spawn(
+fn spawn_stream(
     device_id: &str,
-    dir: Direction,
-    run: impl FnOnce(&Client, StreamInfo, &StreamStats, &AtomicBool) -> Result<()> + Send + 'static,
+    name: &str,
+    run: impl FnOnce(&Client, &StreamStats, &AtomicBool) -> Result<()> + Send + 'static,
 ) -> Result<Stream> {
     let id = device_id.to_owned();
     let stats = Arc::new(StreamStats::default());
-    let stop = Arc::new(AtomicBool::new(false));
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<StreamInfo>>(1);
-
-    let thread = {
-        let (stats, stop) = (stats.clone(), stop.clone());
-        std::thread::Builder::new()
-            .name(format!(
-                "sb-{}",
-                if dir == Direction::Capture { "capture" } else { "render" }
-            ))
-            .spawn(move || -> Result<()> {
-                // Every setup failure goes back to the spawner; only then does the loop start.
-                // COM first in the tuple: bindings drop in reverse, so the client is released
-                // before CoUninitialize.
-                let setup = ComGuard::new().and_then(|com| Ok((com, Client::open(&id)?)));
-                let _mmcss = Mmcss::register(&stats);
-                let _ = ready_tx.send(setup.as_ref().map(|(_, c)| c.info).map_err(Clone::clone));
-                let (_com, client) = setup?;
-                run(&client, client.info, &stats, &stop)
-            })
-            .map_err(|e| Error::new(windows::Win32::Foundation::E_FAIL, e.to_string()))?
-    };
-
-    let info = match ready_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(info)) => info,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err(Error::new(
-                windows::Win32::Foundation::E_FAIL,
-                "audio thread didn't start",
-            ));
-        }
-    };
-    Ok(Stream {
-        info,
-        stats,
-        stop,
-        thread: Some(thread),
-    })
+    let thread_stats = stats.clone();
+    let (thread, info) = RtThread::spawn(
+        name,
+        move || {
+            let client = Client::open(&id)?;
+            let info = client.info;
+            Ok(((Mmcss::register(&thread_stats.mmcss), client, thread_stats), info))
+        },
+        move |(_mmcss, client, stats), stop| run(&client, &stats, stop),
+    )?;
+    Ok(Stream { info, stats, thread })
 }
 
-/// MMCSS registration for the current thread, reverted on drop.
-struct Mmcss(Option<HANDLE>);
+/// MMCSS "Pro Audio" registration for the current thread, reverted on drop. `ok` records
+/// whether Windows granted it.
+pub(crate) struct Mmcss(Option<HANDLE>);
 
 impl Mmcss {
-    fn register(stats: &StreamStats) -> Self {
+    pub(crate) fn register(ok: &AtomicBool) -> Self {
         let mut task_index = 0u32;
         let handle = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) }.ok();
-        stats.mmcss.store(handle.is_some(), Relaxed);
+        ok.store(handle.is_some(), Relaxed);
         Self(handle)
     }
 }
@@ -290,14 +323,14 @@ impl Drop for Mmcss {
 }
 
 /// An initialized, event-driven shared-mode IAudioClient.
-struct Client {
+pub(crate) struct Client {
     client: IAudioClient,
     event: HANDLE,
-    info: StreamInfo,
+    pub(crate) info: StreamInfo,
 }
 
 impl Client {
-    fn open(device_id: &str) -> Result<Self> {
+    pub(crate) fn open(device_id: &str) -> Result<Self> {
         unsafe {
             let client = activate(device_id)?;
 
@@ -325,8 +358,42 @@ impl Client {
     }
 
     /// Wait for the device's event. `false` on timeout.
-    fn wait(&self) -> bool {
+    pub(crate) fn wait(&self) -> bool {
         unsafe { WaitForSingleObject(self.event, WAIT_MS) == WAIT_OBJECT_0 }
+    }
+
+    /// Frames of free space in the endpoint buffer (render).
+    pub(crate) fn free_frames(&self) -> Result<usize> {
+        let padding = unsafe { self.client.GetCurrentPadding()? } as usize;
+        Ok(self.info.buffer_frames.saturating_sub(padding))
+    }
+
+    /// Get the render service, fill the endpoint buffer with silence (so the first period
+    /// doesn't glitch) and start the stream.
+    pub(crate) fn start_render(&self) -> Result<RenderBuffer> {
+        unsafe {
+            let render: IAudioRenderClient = self.client.GetService()?;
+            render.GetBuffer(self.info.buffer_frames as u32)?;
+            render.ReleaseBuffer(self.info.buffer_frames as u32, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)?;
+            self.client.Start()?;
+            Ok(RenderBuffer(render))
+        }
+    }
+}
+
+/// Writes frames into a started render stream.
+pub(crate) struct RenderBuffer(IAudioRenderClient);
+
+impl RenderBuffer {
+    /// Lend `len` frames of the endpoint buffer to `fill`, then hand them to the device.
+    /// `len` must not exceed [`Client::free_frames`].
+    pub(crate) fn write(&self, len: usize, fill: impl FnOnce(&mut [Frame])) -> Result<()> {
+        unsafe {
+            let data = self.0.GetBuffer(len as u32)?;
+            // Stream format is stereo f32 (we asked for it), so the buffer is `len` Frames.
+            fill(std::slice::from_raw_parts_mut(data as *mut Frame, len));
+            self.0.ReleaseBuffer(len as u32, 0)
+        }
     }
 }
 
@@ -361,13 +428,7 @@ fn stereo_f32() -> WAVEFORMATEXTENSIBLE {
 
 // ---- real-time loops: no allocation, no locks, no panics past this point ----
 
-fn capture_loop(
-    c: &Client,
-    _: StreamInfo,
-    mut writer: RingWriter,
-    stats: &StreamStats,
-    stop: &AtomicBool,
-) -> Result<()> {
+fn capture_loop(c: &Client, mut writer: RingWriter, stats: &StreamStats, stop: &AtomicBool) -> Result<()> {
     let capture: IAudioCaptureClient = unsafe { c.client.GetService()? };
     unsafe { c.client.Start()? };
     while !stop.load(Relaxed) {
@@ -399,33 +460,16 @@ fn capture_loop(
     Ok(())
 }
 
-fn render_loop(
-    c: &Client,
-    info: StreamInfo,
-    mut reader: RingReader,
-    stats: &StreamStats,
-    stop: &AtomicBool,
-) -> Result<()> {
-    let render: IAudioRenderClient = unsafe { c.client.GetService()? };
-    // Start with a buffer of silence so the first period doesn't glitch.
-    unsafe {
-        render.GetBuffer(info.buffer_frames as u32)?;
-        render.ReleaseBuffer(info.buffer_frames as u32, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)?;
-        c.client.Start()?;
-    }
+fn render_loop(c: &Client, mut reader: RingReader, stats: &StreamStats, stop: &AtomicBool) -> Result<()> {
+    let render = c.start_render()?;
     while !stop.load(Relaxed) {
         if !c.wait() {
             continue;
         }
-        let padding = unsafe { c.client.GetCurrentPadding()? } as usize;
-        let len = info.buffer_frames.saturating_sub(padding);
-        if len == 0 {
-            continue;
+        let len = c.free_frames()?;
+        if len > 0 {
+            render.write(len, |out| reader.read(out, stats))?;
         }
-        let data = unsafe { render.GetBuffer(len as u32)? };
-        let out = unsafe { std::slice::from_raw_parts_mut(data as *mut Frame, len) };
-        reader.read(out, stats);
-        unsafe { render.ReleaseBuffer(len as u32, 0)? };
     }
     Ok(())
 }

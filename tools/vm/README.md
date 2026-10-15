@@ -33,7 +33,8 @@ User-mode crates (engine, controller) build and run on `sb-build` with `win-carg
 and runs any cargo command there. `sb-build` has an emulated HDA sound card ("Speakers" / "Line In"), so WASAPI code runs end to end:
 ```bash
 tools/vm/win-cargo.sh test -p sb-engine
-tools/vm/win-cargo.sh run -p sb-engine --release --example passthrough -- --seconds 60
+tools/vm/win-cargo.sh run -p sb-engine --release --example passthrough -- --seconds 60   # E1
+tools/vm/win-cargo.sh run -p sb-engine --release --example mix -- --seconds 60           # E2 (--help for options)
 ```
 
 Other commands: `vm.sh status | start | stop | ssh <role> [cmd] | view <role> | seal | revert | password`.

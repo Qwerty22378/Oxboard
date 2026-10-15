@@ -1,8 +1,12 @@
 //! Stateless real-time audio engine. See the Engine Notes in the plan for the design.
 //!
-//! Current state (milestone E1): WASAPI capture thread → SPSC ring → WASAPI render thread,
-//! both on MMCSS "Pro Audio". No mix thread, graph or drift correction yet.
+//! Current state (milestone E2): device threads move audio between WASAPI and SPSC rings;
+//! one mix thread runs a hand-written render plan in fixed blocks, woken by the master clock
+//! (the master output device's event, or a timer). No graph compiler, params or drift
+//! correction yet.
 
+pub mod clock;
+pub mod graph;
 pub mod rt;
 
 #[cfg(windows)]

@@ -66,3 +66,52 @@ impl StreamStats {
         }
     }
 }
+
+/// Mix-thread counters.
+#[derive(Debug, Default)]
+pub struct MixStats {
+    pub blocks: AtomicU64,
+    /// Total time spent rendering blocks, in ns. `busy_ns / (blocks × block duration)` is
+    /// the mix thread's load.
+    pub busy_ns: AtomicU64,
+    /// Slowest single block, in ns.
+    pub max_block_ns: AtomicU64,
+    /// Timer clock only: blocks skipped because the thread fell too far behind to catch up.
+    pub late_blocks: AtomicU64,
+    /// The master device failed and the timer clock took over.
+    pub master_fallback: AtomicBool,
+    /// Whether the thread got its MMCSS "Pro Audio" registration.
+    pub mmcss: AtomicBool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MixSnapshot {
+    pub blocks: u64,
+    pub busy_ns: u64,
+    pub max_block_ns: u64,
+    pub late_blocks: u64,
+    pub master_fallback: bool,
+    pub mmcss: bool,
+}
+
+impl MixStats {
+    pub fn snapshot(&self) -> MixSnapshot {
+        MixSnapshot {
+            blocks: self.blocks.load(Relaxed),
+            busy_ns: self.busy_ns.load(Relaxed),
+            max_block_ns: self.max_block_ns.load(Relaxed),
+            late_blocks: self.late_blocks.load(Relaxed),
+            master_fallback: self.master_fallback.load(Relaxed),
+            mmcss: self.mmcss.load(Relaxed),
+        }
+    }
+
+    /// Record one rendered block (only the mix thread writes).
+    pub(crate) fn block_done(&self, ns: u64) {
+        self.blocks.fetch_add(1, Relaxed);
+        self.busy_ns.fetch_add(ns, Relaxed);
+        if ns > self.max_block_ns.load(Relaxed) {
+            self.max_block_ns.store(ns, Relaxed);
+        }
+    }
+}

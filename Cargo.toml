@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.86"   # slice::get_disjoint_mut
 
 [workspace.dependencies]
 rtrb = "0.4"
