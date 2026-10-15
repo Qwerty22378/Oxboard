@@ -8,7 +8,9 @@
 //! threads. Setup errors are reported back to the spawner before the stream starts; after
 //! that the thread runs until stopped or until the device disappears.
 
-use crate::rt::ring::{RingReader, RingWriter};
+use crate::graph::compile::Endpoints;
+use crate::graph::spec::NodeId;
+use crate::rt::ring::{RingReader, RingSizing, RingWriter};
 use crate::rt::stats::StreamStats;
 use crate::{Frame, SAMPLE_RATE};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -265,6 +267,49 @@ fn activate(device_id: &str) -> Result<IAudioClient> {
 
 fn hns_to_frames(hns: i64) -> usize {
     (hns.max(0) as u64 * SAMPLE_RATE as u64 / 10_000_000) as usize
+}
+
+/// [`Endpoints`] backed by WASAPI streams: binding a device node opens the device and starts
+/// its capture or render thread. Keep this alive as long as the plan runs.
+pub struct WasapiEndpoints {
+    mix_burst: usize,
+    /// Device threads by node, in the order the compiler bound them.
+    pub streams: Vec<(NodeId, Stream)>,
+}
+
+impl WasapiEndpoints {
+    /// `master`: the master device's endpoint ID (sets how many frames the mix moves per
+    /// wake-up, which sizes every ring), or `None` for the timer clock.
+    pub fn new(block: usize, master: Option<&str>) -> Result<Self> {
+        let mix_burst = match master {
+            Some(id) => default_period_frames(id)?.div_ceil(block) * block,
+            None => block,
+        };
+        Ok(Self {
+            mix_burst,
+            streams: Vec::new(),
+        })
+    }
+}
+
+impl Endpoints for WasapiEndpoints {
+    fn input(&mut self, node: NodeId, device: &str) -> std::result::Result<RingReader, String> {
+        let mut open = || -> Result<RingReader> {
+            let (writer, reader) = RingSizing::for_bursts(default_period_frames(device)?, self.mix_burst).ring();
+            self.streams.push((node, spawn_capture(device, writer)?));
+            Ok(reader)
+        };
+        open().map_err(|e| e.message())
+    }
+
+    fn output(&mut self, node: NodeId, device: &str) -> std::result::Result<RingWriter, String> {
+        let mut open = || -> Result<RingWriter> {
+            let (writer, reader) = RingSizing::for_bursts(self.mix_burst, default_period_frames(device)?).ring();
+            self.streams.push((node, spawn_render(device, reader)?));
+            Ok(writer)
+        };
+        open().map_err(|e| e.message())
+    }
 }
 
 /// Start a capture thread that writes the device's audio into `writer`.

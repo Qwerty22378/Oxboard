@@ -8,6 +8,7 @@ license = "MIT"
 rust-version = "1.86"   # slice::get_disjoint_mut
 
 [workspace.dependencies]
+sb-shared = { path = "crates/sb-shared" }
 rtrb = "0.4"
 windows = "0.62"
 

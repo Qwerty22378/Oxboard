@@ -1,12 +1,11 @@
-//! Milestone E2: one mix thread running a hand-written plan in fixed blocks.
+//! Milestones E2 + E3: a `GraphSpec`, compiled to a render plan, run by the mix thread.
 //!
 //!   mix [--in NAME|none] [--out NAME|timer] [--out2 NAME] [--tone HZ] [--tone-gain G]
 //!       [--mic-gain G] [--block FRAMES] [--seconds N]
 //!
-//! Plan: mic (capture thread → ring) and a test tone are mixed onto a bus. The bus is the
-//! master: written straight into the `--out` device, whose event clocks the mix. With
-//! `--out timer` a high-resolution timer clocks it instead and nothing plays directly.
-//! `--out2` also sends the bus through a ring to a second device on its own render thread.
+//! Graph: mic and a test tone feed a bus; the bus feeds the `--out` device (the master: its
+//! event clocks the mix and the mix writes it directly) and optionally `--out2` (through a
+//! ring, on its own render thread). With `--out timer` a high-resolution timer clocks the mix.
 //! Device NAME: part of the name or the full ID; omitted means the default device.
 
 #[cfg(not(windows))]
@@ -25,14 +24,20 @@ fn main() {
 
 #[cfg(windows)]
 mod win {
-    use sb_engine::backend::wasapi::{self, ComGuard, Direction, Stream};
-    use sb_engine::graph::plan::{Op, PlanBuilder};
+    use sb_engine::backend::wasapi::{self, ComGuard, Direction, WasapiEndpoints};
+    use sb_engine::frames_to_ms;
+    use sb_engine::graph::compile::compile;
+    use sb_engine::graph::spec::{EdgeSpec, GraphSpec, NodeId, NodeKind, NodeSpec, ParamId, ParamSpec};
     use sb_engine::rt::mix_thread;
-    use sb_engine::rt::ring::{RingReader, ring};
-    use sb_engine::rt::stats::{MixSnapshot, StreamStats};
-    use sb_engine::{frames_to_ms, ms_to_frames};
-    use std::sync::Arc;
+    use sb_engine::rt::stats::MixSnapshot;
     use std::time::{Duration, Instant};
+
+    const TONE: NodeId = NodeId(1);
+    const BUS: NodeId = NodeId(2);
+    const MIC: NodeId = NodeId(3);
+    const OUT: NodeId = NodeId(4);
+    const OUT2: NodeId = NodeId(5);
+    const MIC_GAIN: ParamId = ParamId(1);
 
     struct Args {
         input: Option<String>,
@@ -100,96 +105,74 @@ mod win {
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args = parse_args()?;
         let _com = ComGuard::new()?;
-        let block = args.block;
 
-        let mut b = PlanBuilder::new(block);
-        let bus = b.buffer();
-        let tone = b.buffer();
-        let osc = b.oscillator();
-        b.op(Op::Sine {
-            osc,
-            dst: tone,
-            freq: args.tone,
-            gain: args.tone_gain,
-        })
-        .op(Op::Clear { dst: bus })
-        .op(Op::MixAdd {
-            src: tone,
-            dst: bus,
-            gain: 1.0,
-        });
-
-        let master_dev = match args.timer {
+        let mut spec = GraphSpec::default();
+        let mut add = |id, kind| spec.nodes.push(NodeSpec { id, kind });
+        let mic = match args.no_input {
+            true => None,
+            false => Some(wasapi::find_device(Direction::Capture, args.input.as_deref())?),
+        };
+        let out = match args.timer {
             true => None,
             false => Some(wasapi::find_device(Direction::Render, args.output.as_deref())?),
         };
-        // How much the mix moves per wake-up: a device master renders its whole period as
-        // back-to-back blocks; the timer wakes once per block.
-        let mix_burst = match &master_dev {
-            Some(d) => wasapi::default_period_frames(&d.id)?.div_ceil(block) * block,
-            None => block,
-        };
-        // A ring's fill swings by the producer's burst plus the consumer's burst (E1 finding),
-        // so that is the least it can start from without underrunning.
-        let mut capture = None;
-        let mut mic_ring_stats = None;
-        if !args.no_input {
-            let dev = wasapi::find_device(Direction::Capture, args.input.as_deref())?;
-            let target = wasapi::default_period_frames(&dev.id)? + mix_burst;
-            let max = target + ms_to_frames(30.0);
-            let (writer, consumer) = ring((max + ms_to_frames(200.0)).next_power_of_two());
-            let (ring_id, stats) = b.input(RingReader::new(consumer, target, max));
-            let mic = b.buffer();
-            b.op(Op::Pull {
-                ring: ring_id,
-                dst: mic,
-            })
-            .op(Op::MixAdd {
-                src: mic,
-                dst: bus,
-                gain: args.mic_gain,
-            });
-            println!("in:   {} (ring target {:.1} ms)", dev.name, frames_to_ms(target));
-            capture = Some(wasapi::spawn_capture(&dev.id, writer)?);
-            mic_ring_stats = Some(stats);
+        let out2 = args
+            .output2
+            .as_deref()
+            .map(|n| wasapi::find_device(Direction::Render, Some(n)))
+            .transpose()?;
+
+        add(
+            TONE,
+            NodeKind::Tone {
+                freq: args.tone,
+                gain: args.tone_gain,
+            },
+        );
+        add(BUS, NodeKind::Bus);
+        let mut edges = vec![(TONE, BUS, None)];
+        if let Some(d) = &mic {
+            add(MIC, NodeKind::DeviceInput { device: d.id.clone() });
+            edges.push((MIC, BUS, Some(MIC_GAIN)));
+            println!("in:     {}", d.name);
         }
-
-        let master = match master_dev {
-            Some(dev) => {
-                println!("master: {}", dev.name);
-                b.op(Op::Master { src: bus });
-                Some(dev.id)
-            }
-            None => {
-                println!("master: timer clock");
-                None
-            }
-        };
-
-        let mut render2 = None;
-        let mut out2_ring_stats = None;
-        if let Some(name) = &args.output2 {
-            let dev = wasapi::find_device(Direction::Render, Some(name))?;
-            let target = wasapi::default_period_frames(&dev.id)? + mix_burst;
-            let max = target + ms_to_frames(30.0);
-            let (writer, consumer) = ring((max + ms_to_frames(200.0)).next_power_of_two());
-            let (ring_id, stats) = b.output(writer);
-            b.op(Op::Push {
-                src: bus,
-                ring: ring_id,
-            });
-            println!("out2: {} (ring target {:.1} ms)", dev.name, frames_to_ms(target));
-            render2 = Some(wasapi::spawn_render(&dev.id, RingReader::new(consumer, target, max))?);
-            out2_ring_stats = Some(stats);
+        if let Some(d) = &out {
+            add(OUT, NodeKind::DeviceOutput { device: d.id.clone() });
+            edges.push((BUS, OUT, None));
+            println!("master: {}", d.name);
+        } else {
+            println!("master: timer clock");
         }
+        if let Some(d) = &out2 {
+            add(OUT2, NodeKind::DeviceOutput { device: d.id.clone() });
+            edges.push((BUS, OUT2, None));
+            println!("out2:   {}", d.name);
+        }
+        spec.edges = edges
+            .into_iter()
+            .map(|(from, to, gain)| EdgeSpec { from, to, gain })
+            .collect();
+        spec.params = vec![ParamSpec {
+            id: MIC_GAIN,
+            value: args.mic_gain,
+        }];
+        spec.master = out.as_ref().map(|_| OUT);
 
-        let plan = b.build();
-        println!("plan ({} frames = {:.2} ms per block):", block, frames_to_ms(block));
+        let mut endpoints = WasapiEndpoints::new(args.block, out.as_ref().map(|d| d.id.as_str()))?;
+        let compiled = compile(&spec, args.block, &mut endpoints)?;
+        let plan = &compiled.plan;
+        println!(
+            "plan: {} ops, {} buffers, {} frames ({:.2} ms) per block",
+            plan.ops().len(),
+            plan.buffer_count(),
+            plan.block(),
+            frames_to_ms(plan.block())
+        );
         for op in plan.ops() {
             println!("  {op:?}");
         }
 
-        let mix = mix_thread::spawn(plan, master.as_deref())?;
+        let mix = mix_thread::spawn(compiled.plan, compiled.master_device.as_deref())?;
         if let Some(d) = mix.master.device {
             println!(
                 "master device: period {:.1} ms, buffer {:.1} ms",
@@ -197,7 +180,10 @@ mod win {
                 frames_to_ms(d.buffer_frames)
             );
         }
-        println!("mix thread MMCSS {}", on_off(mix.stats.snapshot().mmcss));
+        println!(
+            "mix thread MMCSS {}",
+            if mix.stats.snapshot().mmcss { "on" } else { "OFF" }
+        );
 
         let start = Instant::now();
         let mut last = MixSnapshot::default();
@@ -205,14 +191,13 @@ mod win {
             std::thread::sleep(Duration::from_secs(1));
             let m = mix.stats.snapshot();
             let blocks = m.blocks - last.blocks;
-            let busy = m.busy_ns - last.busy_ns;
-            let budget_ns = blocks as f64 * frames_to_ms(block) * 1e6;
+            let budget_ns = blocks as f64 * frames_to_ms(args.block) * 1e6;
             print!(
                 "{:>5.0}s  mix {:>4} blk/s load {:>5.2}% max {:>6.1} us late {:<3}{}",
                 start.elapsed().as_secs_f64(),
                 blocks,
                 if budget_ns > 0.0 {
-                    busy as f64 / budget_ns * 100.0
+                    (m.busy_ns - last.busy_ns) as f64 / budget_ns * 100.0
                 } else {
                     0.0
                 },
@@ -220,25 +205,28 @@ mod win {
                 m.late_blocks,
                 if m.master_fallback { " MASTER LOST→timer" } else { "" },
             );
-            if let Some(s) = &mic_ring_stats {
+            for (_, s) in &compiled.input_stats {
                 let r = s.snapshot();
                 print!(
                     " | mic ring underruns {:<3} trimmed {:<6} fill {:>5.1} ms",
                     r.xruns,
                     r.trimmed_frames,
-                    fill_ms(s)
+                    frames_to_ms(r.ring_fill as usize)
                 );
             }
-            if let Some(r) = &render2 {
-                let s = r.stats.snapshot();
-                print!(" | out2 underruns {:<3} fill {:>5.1} ms", s.xruns, fill_ms(&r.stats));
+            for (node, stream) in endpoints.streams.iter().filter(|(n, _)| *n == OUT2) {
+                let s = stream.stats.snapshot();
+                print!(
+                    " | out2 {} underruns {:<3} fill {:>5.1} ms",
+                    node.0,
+                    s.xruns,
+                    frames_to_ms(s.ring_fill as usize)
+                );
             }
             println!();
             last = m;
 
-            let ended = mix.is_finished()
-                || capture.as_ref().is_some_and(Stream::is_finished)
-                || render2.as_ref().is_some_and(Stream::is_finished);
+            let ended = mix.is_finished() || endpoints.streams.iter().any(|(_, s)| s.is_finished());
             if ended || args.seconds.is_some_and(|s| start.elapsed().as_secs() >= s) {
                 break;
             }
@@ -246,56 +234,41 @@ mod win {
 
         let m = mix.stats.snapshot();
         let mut failed = false;
-        println!(
-            "mix: {} blocks, max block {:.1} us, {} late, master fallback {}, {}",
-            m.blocks,
-            m.max_block_ns as f64 / 1000.0,
-            m.late_blocks,
-            m.master_fallback,
-            ended_how(mix.stop(), &mut failed)
+        let mut report = |what: String, r: windows::core::Result<()>| {
+            let how = match r {
+                Ok(()) => "ok".to_string(),
+                Err(e) => {
+                    failed = true;
+                    format!("FAILED: {e}")
+                }
+            };
+            println!("{what} | {how}");
+        };
+        report(
+            format!(
+                "mix: {} blocks, max block {:.1} us, {} late, master fallback {}",
+                m.blocks,
+                m.max_block_ns as f64 / 1000.0,
+                m.late_blocks,
+                m.master_fallback
+            ),
+            mix.stop(),
         );
-        if let (Some(c), Some(ring)) = (capture, mic_ring_stats) {
-            let (s, r) = (c.stats.snapshot(), ring.snapshot());
+        for (_, s) in &compiled.input_stats {
+            let r = s.snapshot();
             println!(
-                "capture: {} frames, {} overruns | mic ring: {} underruns ({} frames), {} trimmed | {}",
-                s.frames,
-                s.xruns,
-                r.xruns,
-                r.xrun_frames,
-                r.trimmed_frames,
-                ended_how(c.stop(), &mut failed)
+                "mic ring (mix side): {} underruns ({} frames), {} trimmed",
+                r.xruns, r.xrun_frames, r.trimmed_frames
             );
         }
-        if let (Some(rd), Some(ring)) = (render2, out2_ring_stats) {
-            let (s, w) = (rd.stats.snapshot(), ring.snapshot());
-            println!(
-                "out2: {} frames, {} underruns ({} frames), {} trimmed | ring overruns {} | {}",
-                s.frames,
-                s.xruns,
-                s.xrun_frames,
-                s.trimmed_frames,
-                w.xruns,
-                ended_how(rd.stop(), &mut failed)
+        for (node, stream) in endpoints.streams {
+            let s = stream.stats.snapshot();
+            let what = format!(
+                "node {} device thread: {} frames, {} xruns ({} frames), {} trimmed",
+                node.0, s.frames, s.xruns, s.xrun_frames, s.trimmed_frames
             );
+            report(what, stream.stop());
         }
         if failed { Err("a thread failed".into()) } else { Ok(()) }
-    }
-
-    fn fill_ms(s: &Arc<StreamStats>) -> f64 {
-        frames_to_ms(s.snapshot().ring_fill as usize)
-    }
-
-    fn on_off(b: bool) -> &'static str {
-        if b { "on" } else { "OFF" }
-    }
-
-    fn ended_how(r: windows::core::Result<()>, failed: &mut bool) -> String {
-        match r {
-            Ok(()) => "ok".into(),
-            Err(e) => {
-                *failed = true;
-                format!("FAILED: {e}")
-            }
-        }
     }
 }

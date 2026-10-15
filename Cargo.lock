@@ -31,8 +31,13 @@ name = "sb-engine"
 version = "0.1.0"
 dependencies = [
  "rtrb",
+ "sb-shared",
  "windows",
 ]
+
+[[package]]
+name = "sb-shared"
+version = "0.1.0"
 
 [[package]]
 name = "syn"

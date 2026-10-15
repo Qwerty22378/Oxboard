@@ -13,6 +13,39 @@ use crate::rt::stats::StreamStats;
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::atomic::Ordering::Relaxed;
 
+/// Fill levels for a ring between two bursty sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingSizing {
+    /// Start from (and trim back to) this fill.
+    pub target: usize,
+    /// Trim when the fill passes this (clock drift until E6 corrects it smoothly).
+    pub max: usize,
+    /// Ring size: room for a long stall on the reading side.
+    pub capacity: usize,
+}
+
+impl RingSizing {
+    /// The fill swings by the producer's burst plus the consumer's burst, so that is the
+    /// lowest target that can't underrun from scheduling alone. Bursts are in frames: a
+    /// WASAPI device moves one period per wake-up; the mix moves the master period rounded up
+    /// to whole blocks (or one block on the timer clock).
+    pub fn for_bursts(producer: usize, consumer: usize) -> Self {
+        let target = producer + consumer;
+        let max = target + crate::ms_to_frames(30.0);
+        Self {
+            target,
+            max,
+            capacity: (max + crate::ms_to_frames(200.0)).next_power_of_two(),
+        }
+    }
+
+    /// A ring of this size, with a reader using these levels.
+    pub fn ring(self) -> (RingWriter, RingReader) {
+        let (w, c) = ring(self.capacity);
+        (w, RingReader::new(c, self.target, self.max))
+    }
+}
+
 /// Create a ring holding up to `capacity` frames.
 pub fn ring(capacity: usize) -> (RingWriter, Consumer<Frame>) {
     let (producer, consumer) = RingBuffer::new(capacity);
@@ -212,6 +245,13 @@ mod tests {
         assert_eq!(out.to_vec(), frames(8..10));
         assert_eq!(rs.snapshot().trimmed_frames, 8);
         assert_eq!(r.fill(), 2);
+    }
+
+    #[test]
+    fn sizing_covers_both_bursts() {
+        let s = RingSizing::for_bursts(480, 512);
+        assert_eq!(s.target, 480 + 512);
+        assert!(s.max > s.target && s.capacity >= s.max && s.capacity.is_power_of_two());
     }
 
     #[test]

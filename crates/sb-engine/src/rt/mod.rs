@@ -3,5 +3,6 @@
 //! `mix_thread`, so it is tested with plain `cargo test`.
 
 pub mod mix_thread;
+pub mod offline;
 pub mod ring;
 pub mod stats;

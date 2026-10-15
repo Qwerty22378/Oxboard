@@ -1,8 +1,8 @@
 //! Render plan: the flat op list the mix thread executes once per block, plus everything it
 //! touches (scratch buffers, rings, node state), all allocated up front.
 //!
-//! E2 plans are written by hand with [`PlanBuilder`]; the graph compiler (E3) will emit them
-//! from a `GraphSpec`. Gains are constants until the param table arrives (E4).
+//! The graph compiler (`graph::compile`) emits plans from a `GraphSpec`; [`PlanBuilder`] also
+//! works by hand, for tests. Gains are constants until the param table arrives (E4).
 
 use crate::Frame;
 use crate::rt::ring::{RingReader, RingWriter};
@@ -83,6 +83,11 @@ impl RenderPlan {
 
     pub fn ops(&self) -> &[Op] {
         &self.ops
+    }
+
+    /// Scratch buffers the plan allocated.
+    pub fn buffer_count(&self) -> usize {
+        self.bufs.len()
     }
 }
 

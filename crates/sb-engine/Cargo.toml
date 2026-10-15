@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 rtrb.workspace = true
+sb-shared.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true

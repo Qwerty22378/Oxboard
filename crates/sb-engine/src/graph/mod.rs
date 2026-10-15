@@ -1,4 +1,6 @@
-//! From graph to something the audio thread can run. E2 has only the plan itself; the
-//! `GraphSpec` and its compiler arrive in E3.
+//! From graph to something the audio thread can run: the `GraphSpec` (from `sb-shared`),
+//! the compiler, and the render plan it produces.
 
+pub mod compile;
 pub mod plan;
+pub mod spec;
