@@ -96,6 +96,17 @@ struct Sim {
     rng: Rng,
     /// Late stamps: uniform 0..jitter.
     jitter_ns: f64,
+    /// Windows (start, end ns) in which the whole machine is frozen (a VM descheduled by its
+    /// host): events due inside one are processed at its end, in their original order.
+    stalls: Vec<(f64, f64)>,
+    /// What other devices do with a freeze: `false` = catch up afterwards (process every
+    /// missed period), `true` = lose it (capture packets never arrive, render periods pass
+    /// unconsumed), as QEMU's emulated devices do. The master always catches up.
+    lossy_stalls: bool,
+    /// Master tick schedule and leftover frames, kept across `run` calls so slicing a run
+    /// doesn't change its timing.
+    next_master: Option<f64>,
+    free: usize,
 }
 
 impl Sim {
@@ -122,16 +133,34 @@ impl Sim {
             master_period,
             rng: Rng(0x5157_d41f),
             jitter_ns: 500_000.0,
+            stalls: Vec::new(),
+            lossy_stalls: false,
+            next_master: None,
+            free: 0,
         }
     }
 
     /// Run `seconds` of simulated time. The master ticks every period at exactly 48 kHz (it
     /// defines mix time); every other device at its own rate.
+    /// When an event due at `t` actually runs.
+    fn runs_at(&self, t: f64) -> f64 {
+        self.stalls
+            .iter()
+            .find(|(a, b)| (*a..*b).contains(&t))
+            .map_or(t, |&(_, b)| b)
+    }
+
+    /// Freeze everything for `ms`, starting `after_s` seconds from now.
+    fn stall(&mut self, after_s: f64, ms: f64) {
+        let start = self.clock.now as f64 + after_s * 1e9;
+        self.stalls.push((start, start + ms * 1e6));
+    }
+
     fn run(&mut self, seconds: f64) {
         let end_ns = self.clock.now as f64 + seconds * 1e9;
         let master_dt = self.master_period as f64 / 48_000.0 * 1e9;
-        let mut next_master = self.clock.now as f64 + master_dt;
-        let mut free = 0usize;
+        let mut next_master = self.next_master.unwrap_or(self.clock.now as f64 + master_dt);
+        let mut free = self.free;
         let block = self.core.plan().block();
         loop {
             // Earliest pending device event.
@@ -147,8 +176,9 @@ impl Sim {
             if t > end_ns {
                 break;
             }
+            let at = self.runs_at(t);
             if t == next_master {
-                self.clock.now = t as u64;
+                self.clock.now = at as u64;
                 free += self.master_period;
                 while free >= block {
                     self.core.block(&mut self.clock, &self.stats);
@@ -159,6 +189,11 @@ impl Sim {
                 continue;
             }
             let i = dev.unwrap().0;
+            if self.lossy_stalls && at != t {
+                let d = &mut self.engine.endpoints_mut().open[i].2;
+                d.next_ns += d.spec.period as f64 / (48_000.0 * (1.0 + d.spec.ppm * 1e-6)) * 1e9;
+                continue; // this period is lost
+            }
             let jitter = self.rng.below(1000) as f64 / 1000.0 * self.jitter_ns;
             let ep = self.engine.endpoints_mut();
             let tone = ep.tone_hz;
@@ -174,18 +209,20 @@ impl Sim {
                         })
                         .collect();
                     writer.write(Some(&frames), n, &d.stats);
-                    writer.stamp((t + jitter) as u64);
+                    writer.stamp((at + jitter) as u64);
                 }
                 DeviceEnd::Render { reader, played } => {
                     let mut buf = vec![[0.0; 2]; n];
                     reader.read(&mut buf, &d.stats);
-                    reader.stamp((t + jitter) as u64);
+                    reader.stamp((at + jitter) as u64);
                     played.extend(buf.iter().map(|f| f[0]));
                 }
             }
             d.next_ns += n as f64 / (48_000.0 * (1.0 + d.spec.ppm * 1e-6)) * 1e9;
         }
         self.clock.now = end_ns as u64;
+        self.next_master = Some(next_master);
+        self.free = free;
     }
 
     fn device(&self, name: &str) -> &SimDevice {
@@ -317,4 +354,50 @@ fn three_drifting_devices_converge_and_run_clean() {
 fn one_hour_without_drift() {
     let mut sim = drifting_rig();
     check_converged(&mut sim, 120.0, 3600.0);
+}
+
+/// A machine-wide freeze (as on a VM descheduled by its host) disturbs every ring at once;
+/// the controllers must treat it as a transient, not as drift. Returns the worst deviation
+/// from the true drift per ring, and the trims.
+fn stall_deviation(lossy: bool) -> ([f64; 3], u64) {
+    let mut sim = drifting_rig();
+    sim.lossy_stalls = lossy;
+    sim.run(120.0);
+    let want = [(1, 700.0), (4, 400.0), (5, -1500.0)];
+    let mut worst = [0.0f64; 3];
+    for _ in 0..6 {
+        sim.stall(1.0, 50.0);
+        for _ in 0..300 {
+            sim.run(0.1);
+            for (k, (node, w)) in want.iter().enumerate() {
+                worst[k] = worst[k].max((sim.ring_stats(*node).drift_ppm as f64 - w).abs());
+            }
+        }
+    }
+    let trims = ["spk2", "hdmi"]
+        .iter()
+        .map(|d| sim.device(d).stats.snapshot().trimmed_frames)
+        .sum::<u64>()
+        + [1, 4, 5].iter().map(|&n| sim.ring_stats(n).trimmed_frames).sum::<u64>();
+    (worst, trims)
+}
+
+#[test]
+fn stalls_that_catch_up_dont_throw_the_drift_controllers() {
+    let (worst, trims) = stall_deviation(false);
+    assert!(worst.iter().all(|&w| w < 40.0), "ppm strayed {worst:?}");
+    assert_eq!(trims, 0);
+}
+
+#[test]
+fn stalls_that_lose_audio_dont_throw_the_drift_controllers() {
+    // The master catches up 50 ms the other outputs never play, so each trims once per stall
+    // (unavoidable: that time is gone). The controllers re-anchor instead of chasing the
+    // jump; without that they strayed 1300+ ppm and pinned at the limit for many seconds.
+    let (worst, trims) = stall_deviation(true);
+    assert!(worst.iter().all(|&w| w < 500.0), "ppm strayed {worst:?}");
+    assert!(
+        trims <= 6 * 2 * 3000,
+        "trimmed {trims} frames: more than once per output per stall"
+    );
 }

@@ -37,6 +37,14 @@ const KI: f64 = 0.6;
 /// ±1500 ppm drifts and 0.5–1 ms jitter: settles in ~70 s, ratio ripple ~15–30 ppm
 /// (0.05 cents), fill never below the burst margin.
 const FILL_TAU_S: f64 = 2.0;
+/// A gap this long between two measurements means the mix itself was frozen (a VM
+/// descheduled by its host, a long system stall): no device period comes close.
+const STALL_GAP_NS: u64 = 40_000_000;
+/// After a stall, hold the correction this long while the rings re-settle, so the transient
+/// never reaches the filter or the integral.
+const STALL_HOLDOFF_NS: u64 = 1_000_000_000;
+/// After a re-anchor, the setpoint offset fades out with this time constant.
+const REANCHOR_TAU_S: f64 = 60.0;
 
 /// Polyphase table: `PHASES + 1` rows of `TAPS` coefficients, shared by every resampler.
 fn kernel() -> Arc<[f32]> {
@@ -173,6 +181,8 @@ pub struct Pi {
     filtered: Option<f64>,
     integral: f64,
     ppm: f64,
+    /// Setpoint offset after a re-anchor, fading to 0 (bumpless return to the target).
+    offset: f64,
 }
 
 impl Default for Pi {
@@ -181,6 +191,7 @@ impl Default for Pi {
             filtered: None,
             integral: 0.0,
             ppm: 0.0,
+            offset: 0.0,
         }
     }
 }
@@ -188,13 +199,22 @@ impl Default for Pi {
 impl Pi {
     /// Feed one fill measurement (frames), `dt` seconds after the previous one. Returns the
     /// correction in ppm: positive = the ring is too full, so move frames out of it faster.
+    ///
+    /// One measurement moves the filtered fill by at most `target`'s worth of innovation:
+    /// normal ripple (bursts, jitter) stays well inside that, while a sudden jump from a
+    /// disturbance the mix can't see is mostly ignored. Real drift changes slowly, so it
+    /// always gets through.
     pub fn update(&mut self, fill: f64, target: f64, dt: f64) -> f64 {
         let f = match self.filtered {
             None => fill,
-            Some(prev) => prev + (fill - prev) * (dt / FILL_TAU_S).min(1.0),
+            Some(prev) => {
+                let limit = target.max(1.0);
+                prev + (fill - prev).clamp(-limit, limit) * (dt / FILL_TAU_S).min(1.0)
+            }
         };
         self.filtered = Some(f);
-        let error = f - target;
+        self.offset *= 1.0 - (dt / REANCHOR_TAU_S).min(1.0);
+        let error = f - (target + self.offset);
         // Anti-windup: stop integrating while the output is pinned at the limit in the same
         // direction, so a startup transient doesn't leave the integral to unwind for minutes.
         let integral = (self.integral + KI * error * dt).clamp(-MAX_PPM, MAX_PPM);
@@ -210,6 +230,15 @@ impl Pi {
         self.ppm
     }
 
+    /// Restart from `fill` after a discontinuity (a trim, a re-prime, a stall): the filter
+    /// jumps to it, and the gap to `target` becomes an offset that fades out, so the fill
+    /// eases back instead of the proportional term kicking. The integral (the drift
+    /// estimate) is kept.
+    pub fn reanchor(&mut self, fill: f64, target: f64) {
+        self.filtered = Some(fill);
+        self.offset = fill - target;
+    }
+
     pub fn filtered_fill(&self) -> Option<f64> {
         self.filtered
     }
@@ -222,6 +251,14 @@ pub struct Drift {
     pi: Pi,
     target: usize,
     block: usize,
+    /// Time of the previous measurement, for stall detection.
+    last_ns: Option<u64>,
+    /// Hold the correction until then (after a stall).
+    hold_until_ns: u64,
+    /// Fill readings over the second half of a hold-off (sum, count): the level to re-anchor
+    /// on when it ends. A single reading would carry the burst sawtooth.
+    settle_sum: f64,
+    settle_n: u32,
 }
 
 impl Drift {
@@ -234,6 +271,10 @@ impl Drift {
             pi: Pi::default(),
             target,
             block,
+            last_ns: None,
+            hold_until_ns: 0,
+            settle_sum: 0.0,
+            settle_n: 0,
         }
     }
 
@@ -279,8 +320,30 @@ impl Drift {
         self.rs.produce(out.len(), step, |i, a, b| out[i] = [a, b])
     }
 
-    /// Once per block, with the ring's fill as the mix side sees it.
-    pub fn measure(&mut self, fill: usize) {
+    /// Once per block, with the ring's fill as the mix side sees it at `now` (ns). After a
+    /// stall of the mix (a long gap since the previous call) the correction is held for a
+    /// while instead of reacting to the catch-up.
+    pub fn measure(&mut self, fill: usize, now: u64) {
+        if let Some(last) = self.last_ns.replace(now)
+            && now.saturating_sub(last) > STALL_GAP_NS
+        {
+            self.hold_until_ns = now + STALL_HOLDOFF_NS;
+            (self.settle_sum, self.settle_n) = (0.0, 0);
+        }
+        if now < self.hold_until_ns {
+            // Whatever the stall did to the rings (trims, re-primes) is over by the second
+            // half: average the new level there.
+            if now + STALL_HOLDOFF_NS / 2 >= self.hold_until_ns {
+                self.settle_sum += fill as f64;
+                self.settle_n += 1;
+            }
+            return;
+        }
+        if self.settle_n > 0 {
+            self.pi
+                .reanchor(self.settle_sum / self.settle_n as f64, self.target as f64);
+            (self.settle_sum, self.settle_n) = (0.0, 0);
+        }
         let dt = self.block as f64 / SAMPLE_RATE as f64;
         self.pi.update(fill as f64, self.target as f64, dt);
     }

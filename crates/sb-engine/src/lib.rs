@@ -1,10 +1,11 @@
 //! Stateless real-time audio engine. See the Engine Notes in the plan for the design.
 //!
-//! Current state (milestone E5): the controller-facing [`engine::Engine`] compiles each
+//! Current state (milestone E6): the controller-facing [`engine::Engine`] compiles each
 //! `GraphSpec` into a render plan and swaps it into the running mix thread glitch-free (state
 //! carried over by key, edges fading in and out). Params are live and smoothed; meters read
 //! peak and RMS. Device threads move audio between WASAPI and SPSC rings; the mix thread runs
-//! in fixed blocks, woken by the master device's event or a timer. No drift correction yet.
+//! in fixed blocks, woken by the master device's event or a timer, and every device ring is
+//! drift-corrected (sinc resampler + PI controller on timestamped fill estimates).
 
 pub mod clock;
 pub mod engine;

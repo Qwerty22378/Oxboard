@@ -52,7 +52,7 @@ pub fn render_block(plan: &mut RenderPlan, now: u64) -> [&[f32]; 2] {
                         reader.read(&mut frames[..need], stats);
                         d.pull(&frames[..need], l, r);
                         if let Some(fill) = reader.estimated_fill(now) {
-                            d.measure(fill);
+                            d.measure(fill, now);
                         }
                         stats.drift_ppm.store((d.ppm() as f32).to_bits(), Relaxed);
                     }
@@ -138,7 +138,7 @@ pub fn render_block(plan: &mut RenderPlan, now: u64) -> [&[f32]; 2] {
                 writer.write(Some(&frames[..n]), n, stats);
                 if let Some(d) = drift {
                     if let Some(fill) = writer.estimated_fill(now) {
-                        d.measure(fill);
+                        d.measure(fill, now);
                         stats.ring_fill.store(fill as u32, Relaxed);
                     }
                     stats.drift_ppm.store((d.ppm() as f32).to_bits(), Relaxed);

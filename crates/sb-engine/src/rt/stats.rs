@@ -12,12 +12,13 @@ pub struct StreamStats {
     pub xrun_frames: AtomicU64,
     /// Number of separate xrun events (a burst counts once).
     pub xruns: AtomicU64,
-    /// Render: frames skipped to pull the ring back to its target fill (clock drift, no
-    /// resampler yet).
+    /// Render: frames skipped to pull the ring back to its target fill (a safety net: drift
+    /// correction keeps the fill near the target, so this means a stall or a lost period).
     pub trimmed_frames: AtomicU64,
     /// Capture: packets the device flagged as discontinuous (its own glitches).
     pub discontinuities: AtomicU64,
-    /// Render: ring fill seen at the last device callback, in frames.
+    /// Ring fill in frames: as the reader saw it at its last read, or (mix side of an output
+    /// ring) the drift controller's latest estimate.
     pub ring_fill: AtomicU32,
     /// Largest single device request (render) or packet (capture), in frames. A value
     /// well above the period means the thread woke late.
