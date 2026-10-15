@@ -1,0 +1,26 @@
+[package]
+name = "sb-engine"
+version = "0.1.0"
+description = "Stateless real-time audio engine: executes a routing graph over WASAPI devices"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rtrb.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Devices_FunctionDiscovery",  # PKEY_Device_FriendlyName
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",           # events, MMCSS (avrt)
+    "Win32_Security",                   # CreateEventW
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+]

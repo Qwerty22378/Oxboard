@@ -15,31 +15,21 @@ while (( $# )); do
     *) die "unknown option $1" ;;
   esac
 done
-REMOTE='C:\src\soundboard'
 
 wait_ssh build 120
 
-info "Syncing working tree to sb-build"
-tgz=$(mktemp --suffix=.tgz); trap 'rm -f "$tgz"' EXIT
-git -C "$REPO_DIR" ls-files -z --cached --others --exclude-standard | tar -C "$REPO_DIR" --null -T - -czf "$tgz"
-"${SCP[@]}" -q "$tgz" sb-build:C:/src/soundboard.tgz
-# Replace everything except the build cache (target/), so deleted files don't linger.
-vm_ps sb-build "
-  New-Item -ItemType Directory -Force '$REMOTE' | Out-Null
-  Get-ChildItem '$REMOTE' -Force | Where-Object Name -ne 'target' | Remove-Item -Recurse -Force
-  tar -xzf C:\src\soundboard.tgz -C '$REMOTE'
-  if (\$LASTEXITCODE) { exit 1 }"
+sync_tree
 
 info "Building in $DIR: $CMD"
 start=$SECONDS
-vm_ps sb-build "Set-Location '$REMOTE\\${DIR//\//\\}'; $CMD; exit \$LASTEXITCODE" || die "build failed"
+vm_ps sb-build "Set-Location '$REMOTE_SRC\\${DIR//\//\\}'; $CMD; exit \$LASTEXITCODE" || die "build failed"
 info "Build took $((SECONDS - start))s"
 
 if [[ -z $OUT ]]; then
   OUT=$(vm_ps sb-build "
-    Get-ChildItem '$REMOTE\\target' -Recurse -Directory -Filter '*_package' -ErrorAction SilentlyContinue |
+    Get-ChildItem '$REMOTE_SRC\\target' -Recurse -Directory -Filter '*_package' -ErrorAction SilentlyContinue |
       Sort-Object LastWriteTime | Select-Object -Last 1 |
-      ForEach-Object { \$_.FullName.Substring('$REMOTE'.Length + 1) }")
+      ForEach-Object { \$_.FullName.Substring('$REMOTE_SRC'.Length + 1) }")
   [[ -n $OUT ]] || die "no *_package directory found under target/; pass --out"
 fi
 OUT=${OUT//\\//}

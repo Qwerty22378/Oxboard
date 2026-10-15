@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+rtrb = "0.4"
+windows = "0.62"
+
+[profile.release]
+debug = "line-tables-only"   # usable backtraces from release builds

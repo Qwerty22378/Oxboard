@@ -55,3 +55,20 @@ wait_ssh() {
     sleep 10
   done
 }
+
+REMOTE_SRC='C:\src\soundboard'   # working-tree copy on sb-build
+
+# Copy the working tree (tracked + untracked, minus .gitignore'd) to $REMOTE_SRC on sb-build.
+# Everything except the build cache (target/) is replaced, so deleted files don't linger.
+sync_tree() {
+  info "Syncing working tree to sb-build"
+  local tgz; tgz=$(mktemp --suffix=.tgz)
+  git -C "$REPO_DIR" ls-files -z --cached --others --exclude-standard | tar -C "$REPO_DIR" --null -T - -czf "$tgz"
+  "${SCP[@]}" -q "$tgz" sb-build:C:/src/soundboard.tgz
+  rm -f "$tgz"
+  vm_ps sb-build "
+    New-Item -ItemType Directory -Force '$REMOTE_SRC' | Out-Null
+    Get-ChildItem '$REMOTE_SRC' -Force | Where-Object Name -ne 'target' | Remove-Item -Recurse -Force
+    tar -xzf C:\\src\\soundboard.tgz -C '$REMOTE_SRC'
+    if (\$LASTEXITCODE) { exit 1 }"
+}

@@ -29,6 +29,13 @@ tools/vm/deploy-driver.sh target/vm/<pkg> --hwid 'Root\SoundboardVirtualAudio' [
 `deploy-driver.sh` reverts the target to its baseline first (so a BSOD never costs anything), trusts the
 package's test cert, installs with `pnputil`, creates the device with `devgen`, and prints device status and recent errors.
 
+User-mode crates (engine, controller) build and run on `sb-build` with `win-cargo.sh`, which syncs the tree
+and runs any cargo command there. `sb-build` has an emulated HDA sound card ("Speakers" / "Line In"), so WASAPI code runs end to end:
+```bash
+tools/vm/win-cargo.sh test -p sb-engine
+tools/vm/win-cargo.sh run -p sb-engine --release --example passthrough -- --seconds 60
+```
+
 Other commands: `vm.sh status | start | stop | ssh <role> [cmd] | view <role> | seal | revert | password`.
 - `vm.sh revert` – discard everything since the last seal and boot clean (seconds).
 - `vm.sh seal` – make the target's current state the new baseline (e.g. after installing a tool you always want).
