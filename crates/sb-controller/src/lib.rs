@@ -2,7 +2,9 @@
 //! engine graphs, and orchestrates every command from the UI. Current state: C1, the actor
 //! skeleton (state, commands, UI server with snapshot + diffs); C2, state → graph; C3, the
 //! engine link that runs it (spawn, apply, params, heartbeat, crash replay); C4, the Windows
-//! side (devices, app sessions and their volumes, VB-Cable loops).
+//! side (devices, app sessions and their volumes, VB-Cable loops); C5, Interface 2 (the
+//! driver's endpoint pool, per-app outputs, multi-step commands that undo themselves); C6,
+//! the settings saved and loaded.
 //!
 //! - [`state`]: `AppState` = what the user wants (`Desired`) + what's true now (`Observed`).
 //! - [`actor`]: the single owner of that state; everything reaches it as a message.
@@ -12,6 +14,9 @@
 //! - [`engine_link`]: keeps an `sb-engine-host` running the current graph.
 //! - [`watch`] and `win` (Windows only): what Windows shows, scanned on a COM thread and
 //!   reported as observations; app levels set through session volumes.
+//! - [`driver`]: the driver's control plane (endpoint pool), on a worker; [`routing`]: apps
+//!   sent to outputs of their own through it.
+//! - [`persist`]: the settings file: desired state, loaded at startup, saved on change.
 //! - [`view`]: state → the `StateView` the UI is shown; the actor diffs consecutive views.
 //! - [`hub`], [`ui_server`], [`transport`]: connected UIs, their threads, and where they
 //!   connect.
@@ -21,9 +26,12 @@ pub mod actor;
 pub mod client;
 pub mod commands;
 pub mod compile;
+pub mod driver;
 pub mod engine_link;
 pub mod hub;
 pub mod loops;
+pub mod persist;
+pub mod routing;
 pub mod state;
 pub mod transport;
 pub mod ui_server;
@@ -47,7 +55,12 @@ pub struct Controller {
     actor: std::thread::JoinHandle<AppState>,
     link: Option<(mpsc::Sender<LinkMsg>, std::thread::JoinHandle<()>)>,
     windows: Option<std::thread::JoinHandle<()>>,
+    driver: Option<std::thread::JoinHandle<()>>,
+    persist: Option<std::thread::JoinHandle<()>>,
 }
+
+/// Opens the driver's control interface (on the driver worker's thread).
+pub type OpenDriver = Box<dyn FnOnce() -> Result<Box<dyn driver::Transport>, String> + Send>;
 
 /// What a controller runs besides the actor and the UI server.
 #[derive(Default)]
@@ -56,8 +69,12 @@ pub struct Options {
     pub log: bool,
     /// Run engines from this spawner.
     pub engine: Option<(Box<dyn Spawn>, LinkConfig)>,
-    /// Watch Windows' devices and app sessions, and set app levels (Windows only).
+    /// Watch Windows' devices and app sessions, and set app levels and outputs (Windows only).
     pub windows: bool,
+    /// Manage the driver's endpoint pool (Interface 2).
+    pub driver: Option<OpenDriver>,
+    /// Save the settings here whenever they change (load them with [`persist::load`] first).
+    pub persist: Option<(std::path::PathBuf, persist::Timing)>,
 }
 
 impl Controller {
@@ -84,7 +101,7 @@ impl Controller {
         let opts = Options {
             log,
             engine: Some((Box::new(spawner), cfg)),
-            windows: false,
+            ..Default::default()
         };
         Self::launch(listener, state, opts)
     }
@@ -114,6 +131,22 @@ impl Controller {
             }
             None
         };
+        let driver = match opts.driver {
+            Some(open) => {
+                let (tx, thread) = driver::spawn(open, inbox.clone());
+                actor = actor.with_driver(tx);
+                Some(thread)
+            }
+            None => None,
+        };
+        let persist = match opts.persist {
+            Some((path, timing)) => {
+                let (tx, thread) = persist::spawn(path, timing, inbox.clone());
+                actor = actor.with_persist(tx);
+                Some(thread)
+            }
+            None => None,
+        };
         let actor = std::thread::Builder::new()
             .name("sb-actor".into())
             .spawn(move || actor.run(rx))
@@ -125,14 +158,17 @@ impl Controller {
             actor,
             link,
             windows,
+            driver,
+            persist,
         }
     }
 
     /// Wait for the actor to stop (something sent [`Msg::Stop`]), then shut the engine down.
     pub fn join(self) -> AppState {
-        // The actor stops the COM thread on its way out.
+        // The actor stops the COM thread, the driver worker and the persistence worker (after
+        // its last save) on its way out.
         let state = self.actor.join().expect("the actor panicked");
-        if let Some(thread) = self.windows {
+        for thread in [self.windows, self.driver, self.persist].into_iter().flatten() {
             let _ = thread.join();
         }
         if let Some((tx, thread)) = self.link {

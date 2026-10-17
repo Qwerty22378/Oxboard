@@ -6,10 +6,12 @@
 //!   ctl select DEVICE on|off           Interface 1 output selection
 //!   ctl master GAIN | ctl master mute|unmute
 //!   ctl level APP GAIN | ctl level APP mute|unmute
+//!   ctl send APP OUTPUT[,OUTPUT...]    Interface 2: the app plays there; "default" undoes it
 //!   ctl route SOURCE SINK GAIN|off     SOURCE: a device, an app, or "clips"
 //!   ctl clip-add PATH [NAME] | ctl clip-rm ID
 //!   ctl play ID | ctl stop ID          trigger a clip
 //!   ctl restart-engine
+//!   ctl dismiss                        clear the "settings couldn't be read" notice
 //!
 //! DEVICE, APP, SOURCE and SINK match names, case-insensitively, by substring.
 
@@ -93,10 +95,22 @@ fn run() -> Result<(), String> {
             path: path.to_string(),
             name: name.to_string(),
         },
+        ["send", app, "default"] => Command::RouteApp {
+            app: find_app(&c.mirror.view, app)?,
+            outputs: Default::default(),
+        },
+        ["send", app, outs] => Command::RouteApp {
+            app: find_app(&c.mirror.view, app)?,
+            outputs: outs
+                .split(',')
+                .map(|o| device(&c.mirror.view, o.trim(), Some(Flow::Render)))
+                .collect::<Result<_, _>>()?,
+        },
         ["clip-rm", id] => Command::RemoveClip { id: clip(id)? },
         ["play", id] => Command::PlayClip { id: clip(id)? },
         ["stop", id] => Command::StopClip { id: clip(id)? },
         ["restart-engine"] => Command::RestartEngine,
+        ["dismiss"] => Command::DismissLoadError,
         _ => return Err("unknown command (see the top of examples/ctl.rs)".into()),
     };
     let before = c.mirror.view.clone();
@@ -209,8 +223,34 @@ fn sink_name(v: &StateView, s: &Sink) -> String {
     v.devices.get(k).map_or(k.0.clone(), |d| d.name.clone())
 }
 
+fn outputs(v: &StateView, outs: &std::collections::BTreeSet<DeviceKey>) -> String {
+    let names: Vec<String> = outs
+        .iter()
+        .map(|k| v.devices.get(k).map_or(k.0.clone(), |d| d.name.clone()))
+        .collect();
+    names.join(", ")
+}
+
+fn settings(s: &SettingsView) -> String {
+    let mut out = Vec::new();
+    if let Some(e) = &s.load_error {
+        out.push(format!(
+            "couldn't be read ({}), started from defaults; {}",
+            e.reason,
+            e.backup
+                .as_ref()
+                .map_or("the file was left in place".into(), |b| format!("moved to {b}"))
+        ));
+    }
+    if let Some(e) = &s.save_error {
+        out.push(format!("can't be saved ({e})"));
+    }
+    if out.is_empty() { "ok".into() } else { out.join("; ") }
+}
+
 fn show(v: &StateView) {
     println!("engine: {:?}", v.engine);
+    println!("settings: {}", settings(&v.settings));
     println!("master: {}", level(v.master));
     println!(
         "system input: {}",
@@ -240,6 +280,9 @@ fn show(v: &StateView) {
             level(a.level),
             if a.sessions == 0 { "  (not running)" } else { "" }
         );
+        if let Some(r) = &a.route {
+            println!("      -> {} ({:?})", outputs(v, &r.outputs), r.status);
+        }
     }
     println!("routes:");
     for ((from, to), g) in &v.routes {
@@ -275,7 +318,17 @@ fn describe(v: &StateView, op: &DiffOp) -> String {
             if d.failed { ", won't open (retrying)" } else { "" }
         ),
         DiffOp::Device(k, None) => format!("device {} gone", k.0),
-        DiffOp::App(_, Some(a)) => format!("app {}: {} ({} sessions)", a.name, level(a.level), a.sessions),
+        DiffOp::App(_, Some(a)) => format!(
+            "app {}: {} ({} sessions){}",
+            a.name,
+            level(a.level),
+            a.sessions,
+            a.route.as_ref().map_or(String::new(), |r| format!(
+                ", -> {} ({:?})",
+                outputs(v, &r.outputs),
+                r.status
+            ))
+        ),
         DiffOp::App(k, None) => format!("app {} gone", k.0),
         DiffOp::Clip(id, Some(c)) => format!(
             "clip #{} {}: {} {}{}",
@@ -301,6 +354,7 @@ fn describe(v: &StateView, op: &DiffOp) -> String {
         DiffOp::SystemInput(i) => format!("system input: {i:?}"),
         DiffOp::Master(l) => format!("master: {}", level(*l)),
         DiffOp::Engine(e) => format!("engine: {e:?}"),
+        DiffOp::Settings(s) => format!("settings: {}", settings(s)),
     }
 }
 

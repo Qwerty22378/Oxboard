@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Bumped on any incompatible change to these types.
-pub const UI_PROTOCOL_VERSION: u32 = 1;
+pub const UI_PROTOCOL_VERSION: u32 = 2;
 /// Highest gain anything accepts: +6 dB, the top of the fader taper.
 pub const MAX_GAIN: f32 = 2.0;
 
@@ -157,6 +157,25 @@ pub struct AppView {
     pub level: Level,
     /// Audio sessions the app has open right now; 0: not running (its settings are kept).
     pub sessions: u32,
+    /// Interface 2: where the app is sent, if anywhere but the Windows default.
+    pub route: Option<AppRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppRoute {
+    pub outputs: BTreeSet<DeviceKey>,
+    pub status: RouteStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteStatus {
+    /// The app isn't running; it's sent there when it starts.
+    NotRunning,
+    /// Windows was told, but the app still plays elsewhere. Apps move when they open a new
+    /// stream (often a restart), and apps with their own device setting never move.
+    Pending,
+    /// The app plays through its endpoint.
+    Active,
 }
 
 /// What the user sets on a clip.
@@ -175,6 +194,23 @@ pub struct ClipView {
     pub playing: bool,
 }
 
+/// Trouble with the settings file, for the UI to tell the user about.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SettingsView {
+    /// The file couldn't be read at startup, so the soundboard started from defaults. Shown
+    /// until dismissed (`Command::DismissLoadError`).
+    pub load_error: Option<LoadError>,
+    /// Why the last save failed; cleared by the next one that works.
+    pub save_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoadError {
+    pub reason: String,
+    /// Where the unreadable file was moved, so nothing is lost (`None`: it couldn't be moved).
+    pub backup: Option<String>,
+}
+
 /// Everything a UI shows. Maps are keyed and ordered, so a diff is per entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateView {
@@ -188,6 +224,7 @@ pub struct StateView {
     pub system_input: Option<SystemInput>,
     pub master: Level,
     pub engine: EngineStatus,
+    pub settings: SettingsView,
 }
 
 impl Default for StateView {
@@ -201,6 +238,7 @@ impl Default for StateView {
             system_input: None,
             master: Level::UNITY,
             engine: EngineStatus::Down,
+            settings: SettingsView::default(),
         }
     }
 }
@@ -216,6 +254,7 @@ pub enum DiffOp {
     SystemInput(Option<SystemInput>),
     Master(Level),
     Engine(EngineStatus),
+    Settings(SettingsView),
 }
 
 /// The ops that turn `old` into `new` (empty when they're equal).
@@ -239,6 +278,9 @@ pub fn diff(old: &StateView, new: &StateView) -> Vec<DiffOp> {
     }
     if old.engine != new.engine {
         ops.push(DiffOp::Engine(new.engine.clone()));
+    }
+    if old.settings != new.settings {
+        ops.push(DiffOp::Settings(new.settings.clone()));
     }
     ops
 }
@@ -284,6 +326,7 @@ impl StateView {
                 DiffOp::SystemInput(i) => self.system_input = i,
                 DiffOp::Master(l) => self.master = l,
                 DiffOp::Engine(e) => self.engine = e,
+                DiffOp::Settings(s) => self.settings = s,
             }
         }
     }
@@ -334,8 +377,16 @@ pub enum Command {
     StopClip {
         id: ClipId,
     },
+    /// Interface 2: play the app through these outputs (via its own driver endpoint), or
+    /// back through the Windows default (`outputs` empty).
+    RouteApp {
+        app: AppKey,
+        outputs: BTreeSet<DeviceKey>,
+    },
     /// Restart the engine now: after it gave up (`EngineStatus::Failed`), or to start afresh.
     RestartEngine,
+    /// The user has seen `SettingsView::load_error`.
+    DismissLoadError,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -402,7 +453,7 @@ pub enum UiMessage {
     /// The whole view as of diff number `seq`; the next diff is `seq + 1`.
     Snapshot {
         seq: u64,
-        view: StateView,
+        view: Box<StateView>,
     },
     Diff {
         seq: u64,
@@ -442,7 +493,7 @@ impl Mirror {
     pub fn apply(&mut self, msg: &UiMessage) -> Synced {
         match msg {
             UiMessage::Snapshot { seq, view } => {
-                self.view = view.clone();
+                self.view = (**view).clone();
                 self.seq = *seq;
                 self.synced = true;
                 Synced::Updated
@@ -499,7 +550,7 @@ mod tests {
     /// One random edit: insert, change or remove an entry somewhere, or change a scalar.
     fn mutate(v: &mut StateView, r: &mut Rng) {
         let remove = r.below(3) == 0;
-        match r.below(6) {
+        match r.below(7) {
             0 => {
                 let k = dev(r.below(6));
                 if remove {
@@ -533,6 +584,11 @@ mod tests {
                                 muted: r.below(4) == 0,
                             },
                             sessions: r.below(3) as u32,
+                            route: (r.below(3) == 0).then(|| AppRoute {
+                                outputs: [DeviceKey(format!("out{}", r.below(3)))].into(),
+                                status: [RouteStatus::NotRunning, RouteStatus::Pending, RouteStatus::Active]
+                                    [r.below(3) as usize],
+                            }),
                         },
                     );
                 }
@@ -581,6 +637,15 @@ mod tests {
                     0 => None,
                     1 => Some(SystemInput::Device(dev(r.below(6)))),
                     _ => Some(SystemInput::Endpoint(r.below(4) as u32)),
+                };
+            }
+            5 => {
+                v.settings = SettingsView {
+                    load_error: (r.below(2) == 0).then(|| LoadError {
+                        reason: format!("line {}", r.below(9)),
+                        backup: (r.below(2) == 0).then(|| "config.toml.bad".into()),
+                    }),
+                    save_error: (r.below(2) == 0).then(|| "disk full".into()),
                 };
             }
             _ => {
@@ -648,7 +713,13 @@ mod tests {
             ops: vec![DiffOp::Master(Level { gain, muted: false })],
         };
         assert_eq!(m.apply(&diff_to(1, 0.1)), Synced::Ignored, "no snapshot yet");
-        assert_eq!(m.apply(&UiMessage::Snapshot { seq: 4, view }), Synced::Updated);
+        assert_eq!(
+            m.apply(&UiMessage::Snapshot {
+                seq: 4,
+                view: Box::new(view)
+            }),
+            Synced::Updated
+        );
         assert_eq!(m.apply(&diff_to(5, 0.7)), Synced::Updated);
         assert_eq!(m.view.master.gain, 0.7);
         assert_eq!(m.apply(&UiMessage::Accepted(3)), Synced::Ignored);
@@ -658,7 +729,13 @@ mod tests {
         assert_eq!(m.view.master.gain, 0.7);
         let mut fresh = StateView::default();
         fresh.master.gain = 0.9;
-        assert_eq!(m.apply(&UiMessage::Snapshot { seq: 8, view: fresh }), Synced::Updated);
+        assert_eq!(
+            m.apply(&UiMessage::Snapshot {
+                seq: 8,
+                view: Box::new(fresh),
+            }),
+            Synced::Updated
+        );
         assert_eq!(m.apply(&diff_to(9, 0.2)), Synced::Updated);
         assert_eq!((m.seq, m.view.master.gain), (9, 0.2));
     }
@@ -734,7 +811,7 @@ mod tests {
             UiMessage::Refused { reason: "old".into() },
             UiMessage::Snapshot {
                 seq: 3,
-                view: view.clone(),
+                view: Box::new(view.clone()),
             },
             UiMessage::Diff {
                 seq: 4,

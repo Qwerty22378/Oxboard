@@ -18,6 +18,7 @@ postcard = { version = "1.1.3", features = ["use-std"] }
 rtrb = "0.4"
 serde = { version = "1.0.228", features = ["derive"] }
 symphonia = { version = "0.5.5", features = ["mp3"] }   # 0.5: stable API; adds MP3 to the defaults (Vorbis/Ogg, FLAC, WAV, PCM, ADPCM, MKV)
+toml = "0.9.12"   # the controller's settings file
 windows = "0.62"
 windows-core = "0.62"   # the #[implement] macro for COM callbacks names this crate
 

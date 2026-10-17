@@ -1,8 +1,9 @@
 //! `AppState` → `StateView`: what the UI is shown. Pure; the actor diffs consecutive views.
 
 use crate::loops;
+use crate::routing::Routing;
 use crate::state::AppState;
-use sb_shared::ui::{AppView, ClipView, DeviceView, Flow, Level, Source, StateView};
+use sb_shared::ui::{AppRoute, AppView, ClipView, DeviceView, Flow, Level, RouteStatus, Source, StateView};
 
 pub fn project(state: &AppState) -> StateView {
     let (d, o) = (&state.desired, &state.observed);
@@ -11,6 +12,7 @@ pub fn project(state: &AppState) -> StateView {
         engine: o.engine.clone(),
         routes: d.matrix.clone(),
         system_input: d.system_input.clone(),
+        settings: o.settings.clone(),
         ..StateView::default()
     };
     // Present devices, plus the absent ones the user still has picked (greyed out).
@@ -49,6 +51,14 @@ pub fn project(state: &AppState) -> StateView {
                     .or_else(|| o.sessions.get(key).and_then(|s| s.level))
                     .unwrap_or(Level::UNITY),
                 sessions: o.sessions.get(key).map_or(0, |s| s.pids.len() as u32),
+                route: d.app_routes.get(key).map(|outputs| AppRoute {
+                    outputs: outputs.clone(),
+                    status: match (o.sessions.get(key), Routing::endpoint_device(state, key)) {
+                        (None, _) => RouteStatus::NotRunning,
+                        (Some(s), Some(dev)) if s.devices.contains(&dev) => RouteStatus::Active,
+                        (Some(_), _) => RouteStatus::Pending,
+                    },
+                }),
             },
         );
     }

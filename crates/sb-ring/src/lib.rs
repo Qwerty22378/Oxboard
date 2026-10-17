@@ -1,6 +1,7 @@
 //! The shared-memory ring between the soundboard engine (user mode) and its virtual audio
-//! driver (kernel), and the data-plane IOCTL ABI that hands it over. `#![no_std]` and
-//! dependency-free, so the driver and the engine build the same layout from the same source.
+//! driver (kernel), the data-plane IOCTL ABI that hands it over, and the control-plane ABI the
+//! controller manages the endpoint pool with ([`control`]). `#![no_std]` and dependency-free,
+//! so the driver and user mode build the same layout from the same source.
 //!
 //! **The memory is untrusted on both sides.** It lives in user-mode pages that any process
 //! holding the stream interface could rewrite at any moment. So:
@@ -25,6 +26,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod control;
 pub mod ioctl;
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};

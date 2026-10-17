@@ -4,8 +4,9 @@
 //! `Shutdown`, disconnects, or crashes (the pipe breaks). Exit code 0 for those, 1 if the
 //! handshake was refused, 2 if the mix thread died, 3 on bad arguments or pipe errors.
 //!
-//! `--fake-driver` serves virtual endpoints 1 (an app playing 660 Hz) and 2 (a virtual mic)
-//! through the user-mode `FakeDriver`, until the real driver link exists (D6).
+//! `--fake-driver` serves the controller's fake pool through the user-mode `FakeDriver`,
+//! until the real driver link exists (D6): endpoints 1..=8 are apps playing tones (660 Hz,
+//! 770 Hz, ...), 9 and 10 virtual mics.
 
 #[cfg(not(windows))]
 fn main() {
@@ -54,22 +55,23 @@ mod win {
             master: Option<&str>,
         ) -> Result<Started<WasapiEndpoints>, String> {
             let started = if self.fake_driver {
-                let driver = FakeDriver::new(vec![
-                    FakeEndpoint {
-                        id: 1,
-                        direction: Direction::FromApps,
-                        period_frames: 480,
-                        ppm: 0.0,
-                        tone_hz: 660.0,
-                    },
-                    FakeEndpoint {
-                        id: 2,
-                        direction: Direction::ToApps,
-                        period_frames: 480,
-                        ppm: 0.0,
-                        tone_hz: 0.0,
-                    },
-                ]);
+                // The controller's `--fake-driver` pool: apps play into 1..=8 (each a tone,
+                // 660 Hz and up), 9 and 10 are virtual mics.
+                let app = |id: u32| FakeEndpoint {
+                    id,
+                    direction: Direction::FromApps,
+                    period_frames: 480,
+                    ppm: 0.0,
+                    tone_hz: 660.0 + 110.0 * f64::from(id - 1),
+                };
+                let mic = |id| FakeEndpoint {
+                    id,
+                    direction: Direction::ToApps,
+                    period_frames: 480,
+                    ppm: 0.0,
+                    tone_hz: 0.0,
+                };
+                let driver = FakeDriver::new((1..=8).map(app).chain([mic(9), mic(10)]).collect());
                 start_wasapi_with_driver(block, tables, master, Box::new(driver))
             } else {
                 start_wasapi(block, tables, master)

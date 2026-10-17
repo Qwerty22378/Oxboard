@@ -1,6 +1,6 @@
 //! `AppState`: everything the controller knows, owned by the actor alone.
 //!
-//! - [`Desired`] is what the user asked for. It's the part that gets persisted (C6), and it
+//! - [`Desired`] is what the user asked for. It's the part that gets saved ([`crate::persist`]), and it
 //!   survives devices and apps coming and going: an unplugged output stays selected and plays
 //!   again when it's back.
 //! - [`Observed`] is what's true right now, rebuilt at runtime from Windows (C4), the driver
@@ -9,7 +9,9 @@
 //! Keys are the stable ones from `sb_shared::ui` (endpoint IDs, executable paths), never
 //! names, indices or PIDs.
 
-use sb_shared::ui::{AppKey, ClipId, ClipSettings, DeviceKey, EngineStatus, Flow, Level, Sink, Source, SystemInput};
+use sb_shared::ui::{
+    AppKey, ClipId, ClipSettings, DeviceKey, EngineStatus, Flow, Level, SettingsView, Sink, Source, SystemInput,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
@@ -71,14 +73,20 @@ pub struct Observed {
     pub engine: EngineStatus,
     /// Clips with voices playing (from the engine's `ClipEnded` and our triggers, C3).
     pub playing: BTreeSet<ClipId>,
-    /// The driver's virtual render endpoints, by id (C5).
+    /// The driver, and its endpoint pool by id (C5).
+    pub driver: DriverStatus,
     pub endpoints: BTreeMap<u32, PoolEndpoint>,
+    /// Whether Windows lets the controller pick an app's output (`IAudioPolicyConfigFactory`);
+    /// `None` until the COM thread has looked.
+    pub app_routing: Option<bool>,
     /// Render devices whose sound comes back in somewhere: a cable's input reappears on its
     /// output, a driver endpoint in the mix. Playing into one from its own source loops.
     pub loopbacks: BTreeMap<DeviceKey, Loopback>,
     /// Devices Windows lists but the engine couldn't keep open (`DeviceLost`): left out of
     /// the graph until `retry_at`, then tried again.
     pub failed: BTreeMap<DeviceKey, Failed>,
+    /// Trouble reading or writing the settings file (C6).
+    pub settings: SettingsView,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,10 +97,36 @@ pub struct Failed {
     pub retry_at: Option<Instant>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolEndpoint {
     /// Enabled in the driver (a disabled one doesn't exist for Windows or the engine).
     pub enabled: bool,
+    /// `Render`: apps play into it and the engine reads it. `Capture`: a virtual mic.
+    pub flow: Flow,
+    pub name: String,
+    /// Its Windows endpoint, while enabled.
+    pub device: Option<DeviceKey>,
+}
+
+impl Default for PoolEndpoint {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            flow: Flow::Render,
+            name: String::new(),
+            device: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DriverStatus {
+    /// Not looked for yet.
+    #[default]
+    Unknown,
+    /// Not installed, or not usable (the reason).
+    Missing(String),
+    Ready,
 }
 
 /// Where what's played into a render device comes back in.
@@ -111,9 +145,12 @@ impl Default for Observed {
             sessions: BTreeMap::new(),
             engine: EngineStatus::Down,
             playing: BTreeSet::new(),
+            driver: DriverStatus::Unknown,
             endpoints: BTreeMap::new(),
+            app_routing: None,
             loopbacks: BTreeMap::new(),
             failed: BTreeMap::new(),
+            settings: SettingsView::default(),
         }
     }
 }
@@ -126,6 +163,8 @@ pub struct AppSessions {
     pub pids: BTreeSet<u32>,
     /// The app's session volume, as Windows last reported it.
     pub level: Option<Level>,
+    /// The render devices the app has sessions on.
+    pub devices: BTreeSet<DeviceKey>,
 }
 
 /// A change in the world, posted by whoever watches it (the COM thread, C4; tests).
@@ -163,6 +202,14 @@ pub enum Observation {
         app: AppKey,
         level: Level,
     },
+    /// The render devices an app has sessions on now.
+    AppDevices {
+        app: AppKey,
+        devices: BTreeSet<DeviceKey>,
+    },
+    Driver(DriverStatus),
+    /// Whether per-app routing works on this Windows.
+    AppRouting(bool),
 }
 
 impl Desired {
@@ -265,11 +312,26 @@ impl AppState {
                 }
             }
             Observation::Endpoint { id, state } => {
+                // An enabled render endpoint is a Windows device whose sound comes back in
+                // through the engine: a loopback, for the loop check.
+                self.observed.loopbacks.retain(|_, l| *l != Loopback::Endpoint(id));
                 match state {
-                    Some(e) => self.observed.endpoints.insert(id, e),
+                    Some(e) => {
+                        if let (Some(dev), Flow::Render) = (&e.device, e.flow) {
+                            self.observed.loopbacks.insert(dev.clone(), Loopback::Endpoint(id));
+                        }
+                        self.observed.endpoints.insert(id, e)
+                    }
                     None => self.observed.endpoints.remove(&id),
                 };
             }
+            Observation::AppDevices { app, devices } => {
+                if let Some(s) = self.observed.sessions.get_mut(&app) {
+                    s.devices = devices;
+                }
+            }
+            Observation::Driver(d) => self.observed.driver = d,
+            Observation::AppRouting(ok) => self.observed.app_routing = Some(ok),
             Observation::Loopback { render, into } => {
                 match into {
                     Some(l) => self.observed.loopbacks.insert(render, l),

@@ -24,6 +24,15 @@ pub enum WinMsg {
         app: AppKey,
         level: Level,
     },
+    /// Send the app's processes to `device` from now on (their per-app default output), or
+    /// back to the Windows default (`None`). Answered with `Msg::WinDone { op }`; `op` 0 wants
+    /// no answer.
+    SetAppOutput {
+        op: u64,
+        app: AppKey,
+        pids: Vec<u32>,
+        device: Option<DeviceKey>,
+    },
     /// Something changed (from a notification callback): scan again.
     Rescan {
         devices: bool,
@@ -45,6 +54,8 @@ pub struct SeenDevice {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeenSession {
     pub app: AppKey,
+    /// The render device it plays on.
+    pub device: DeviceKey,
     /// Display name for the app.
     pub name: String,
     pub pid: u32,
@@ -168,6 +179,21 @@ pub fn changes(old: &World, new: &World, levels: &mut Levels) -> Vec<Observation
         }
     }
 
+    // Where each app plays.
+    let devices = |w: &World| -> BTreeMap<AppKey, BTreeSet<DeviceKey>> {
+        let mut m: BTreeMap<AppKey, BTreeSet<DeviceKey>> = BTreeMap::new();
+        for s in w.sessions.values() {
+            m.entry(s.app.clone()).or_default().insert(s.device.clone());
+        }
+        m
+    };
+    let old_devices = devices(old);
+    for (app, d) in devices(new) {
+        if old_devices.get(&app) != Some(&d) {
+            out.push(Observation::AppDevices { app, devices: d });
+        }
+    }
+
     // Levels, per session: a session whose volume moved to something the controller didn't
     // set was changed outside (the Windows mixer, the app). A new app reports the level it
     // starts with. One report per app.
@@ -200,6 +226,22 @@ pub fn exe_name(path: &str) -> &str {
         Some((stem, ext)) if !stem.is_empty() && ext.eq_ignore_ascii_case("exe") => stem,
         _ => file,
     }
+}
+
+/// `KSCATEGORY_AUDIO` render device interface class, as Windows' policy paths end.
+const RENDER_INTERFACE: &str = "{e6327cad-dcec-4949-ae8a-991e976a79d2}";
+
+/// How the per-app output API names a render endpoint: its device interface path,
+/// `\\?\SWD#MMDEVAPI#{0.0.0.00000000}.{guid}#{e6327cad-…}`.
+pub fn policy_path(device: &DeviceKey) -> String {
+    format!(r"\\?\SWD#MMDEVAPI#{}#{RENDER_INTERFACE}", device.0)
+}
+
+/// The endpoint in such a path (`None` for an empty one: no per-app output).
+pub fn device_of_policy_path(path: &str) -> Option<DeviceKey> {
+    let rest = path.split("MMDEVAPI#").nth(1)?;
+    let id = rest.split('#').next()?;
+    (!id.is_empty()).then(|| DeviceKey(id.to_owned()))
 }
 
 /// The soundboard's own processes play too (the engine host renders to every output), but
@@ -245,6 +287,7 @@ mod tests {
             id.into(),
             SeenSession {
                 app: AppKey(format!(r"C:\{app}.exe")),
+                device: DeviceKey("{spk}".into()),
                 name: app.into(),
                 pid,
                 level: Level { gain, muted: false },
@@ -334,16 +377,27 @@ mod tests {
             .into(),
             ..Default::default()
         };
+        let mut a = a;
+        a.sessions.get_mut("s2").unwrap().device = DeviceKey("{headphones}".into());
         let ch = changes(&World::default(), &a, &mut levels);
         let added: Vec<_> = ch
             .iter()
             .filter(|o| matches!(o, Observation::SessionAdded { .. }))
             .collect();
         assert_eq!(added.len(), 2);
-        // Each app's level is reported once, after its session.
-        assert_eq!(ch.len(), 4);
+        // Then where each app plays, then each app's level once.
+        let speakers = DeviceKey("{spk}".into());
+        let headphones = DeviceKey("{headphones}".into());
         assert_eq!(
-            ch[3],
+            ch[2],
+            Observation::AppDevices {
+                app: key("discord"),
+                devices: [headphones.clone(), speakers.clone()].into()
+            }
+        );
+        assert_eq!(ch.len(), 6);
+        assert_eq!(
+            ch[5],
             Observation::AppLevel {
                 app: key("game"),
                 level: lvl(0.5)
@@ -351,7 +405,14 @@ mod tests {
         );
         let mut b = a.clone();
         b.sessions.remove("s2");
-        assert!(changes(&a, &b, &mut levels).is_empty(), "discord still has a session");
+        assert_eq!(
+            changes(&a, &b, &mut levels),
+            [Observation::AppDevices {
+                app: key("discord"),
+                devices: [speakers].into()
+            }],
+            "discord still has a session, on one device now"
+        );
         b.sessions.remove("s1");
         assert_eq!(
             changes(&a, &b, &mut levels),
@@ -437,6 +498,14 @@ mod tests {
         assert_eq!(usable_display_name("@%SystemRoot%\\System32\\AudioSrv.Dll,-202"), None);
         assert_eq!(usable_display_name("Spotify"), Some("Spotify"));
         assert!(is_ours(r"C:\Program Files\Soundboard\SB-Engine-Host.exe"));
+        let spk = DeviceKey("{0.0.0.00000000}.{55928b0d-9863-4020-9c6d-18d443fe3af6}".into());
+        let path = policy_path(&spk);
+        assert_eq!(
+            path,
+            r"\\?\SWD#MMDEVAPI#{0.0.0.00000000}.{55928b0d-9863-4020-9c6d-18d443fe3af6}#{e6327cad-dcec-4949-ae8a-991e976a79d2}"
+        );
+        assert_eq!(device_of_policy_path(&path), Some(spk));
+        assert_eq!(device_of_policy_path(""), None);
         assert!(!is_ours(r"C:\Games\sb-engine-host-clone.exe"));
     }
 }

@@ -19,6 +19,9 @@
 //! - After [`LinkConfig::give_up_after`] crashes inside [`LinkConfig::crash_window`] the link
 //!   stops trying and reports `Failed`; `Command::RestartEngine` starts it again.
 //!
+//! A refused graph is reported, not a crash (the host keeps the last one), except a fresh
+//! host's first graph failing for anything but a device: then the engine couldn't start.
+//!
 //! While a graph is being applied the link waits for the host's reply (up to 10 s), not for
 //! heartbeats: the host's loop is busy loading the graph's clips then, and a big replay can
 //! take longer than the heartbeat timeout.
@@ -280,8 +283,11 @@ impl Link {
         match h.client.apply_graph(c.graph.clone(), version) {
             Ok(Ok(())) => h.last_heard = Instant::now(),
             // A host that can't run its first graph can't run anything (the audio side
-            // didn't start): count it as a crash.
-            Ok(Err(error)) if fresh => self.crashed(format!("the engine can't start: {error}")),
+            // didn't start): count it as a crash. Unless a device in it is to blame: the
+            // controller leaves that one out and sends another graph.
+            Ok(Err(error)) if fresh && !matches!(error, GraphError::Endpoint { .. }) => {
+                self.crashed(format!("the engine can't start: {error}"))
+            }
             Ok(Err(error)) => self.report(EngineReport::Refused { version, error }),
             Err(e) => self.crashed(e),
         }

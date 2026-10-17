@@ -201,3 +201,57 @@ fn diffs_arrive_while_a_fader_is_dragged() {
     assert_eq!(watcher.mirror.view.master.gain, 2.0);
     controller.stop();
 }
+
+#[test]
+fn settings_outlive_the_controller() {
+    let dir = std::env::temp_dir().join(format!("sb-controller-settings-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("config.toml");
+    let launch = |name: &str| {
+        let loaded = sb_controller::persist::load(&path);
+        assert!(loaded.error.is_none(), "{:?}", loaded.error);
+        let addr = address(name);
+        let opts = sb_controller::Options {
+            persist: Some((path.clone(), sb_controller::persist::Timing::default())),
+            ..Default::default()
+        };
+        let controller = Controller::launch(transport::bind(&addr).unwrap(), loaded.state(), opts);
+        (controller, addr)
+    };
+
+    let (controller, addr) = launch("settings-1");
+    controller
+        .inbox
+        .send(Msg::Observed(Observation::DeviceAdded {
+            key: speakers(),
+            info: DeviceInfo {
+                name: "Speakers".into(),
+                flow: Flow::Render,
+            },
+        }))
+        .unwrap();
+    let mut ui = client(&addr, "test");
+    ui.subscribe().unwrap();
+    let select = Command::SelectOutput {
+        device: speakers(),
+        selected: true,
+    };
+    assert_eq!(ui.call(select, T).unwrap(), Ok(()));
+    assert_eq!(ui.call(Command::SetMasterGain(0.4), T).unwrap(), Ok(()));
+    // Stopped within the debounce: the last change is written on the way out.
+    controller.stop();
+    assert!(std::fs::read_to_string(&path).unwrap().contains("master_gain = 0.4"));
+
+    // Back with the speakers unplugged: still selected, by their remembered name.
+    let (controller, addr) = launch("settings-2");
+    let mut ui = client(&addr, "test");
+    ui.subscribe().unwrap();
+    sync_to(&mut ui, 0);
+    let v = &ui.mirror.view;
+    assert_eq!(v.master.gain, 0.4);
+    let d = &v.devices[&speakers()];
+    assert!(d.selected && !d.present && d.name == "Speakers", "{d:?}");
+    assert_eq!(v.settings, SettingsView::default());
+    controller.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}

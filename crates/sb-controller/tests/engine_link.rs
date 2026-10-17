@@ -85,6 +85,8 @@ struct Script {
     silent: AtomicBool,
     /// Refuse graphs with this version or later (0: none).
     refuse_from: AtomicU64,
+    /// Blame a device for the refusal (else the graph itself).
+    blame_device: AtomicBool,
 }
 
 #[derive(Clone, Default)]
@@ -163,10 +165,16 @@ fn fake_host(n: usize, stream: UnixStream, script: &Script, log: &Mutex<Vec<(usi
             RequestBody::ApplyGraph { version, .. } => {
                 let from = script.refuse_from.load(SeqCst);
                 if from != 0 && version >= from {
-                    send(&reply(Err(GraphError::Endpoint {
-                        node: sb_shared::graph::NodeId(0),
-                        reason: "fake refusal".into(),
-                    })));
+                    let node = sb_shared::graph::NodeId(0);
+                    let error = if script.blame_device.load(SeqCst) {
+                        GraphError::Endpoint {
+                            node,
+                            reason: "Element not found.".into(),
+                        }
+                    } else {
+                        GraphError::UnknownNode { edge: 0, node }
+                    };
+                    send(&reply(Err(error)));
                 } else {
                     send(&reply(Ok(())));
                     send(&HostMessage::Event(EngineEvent::GraphApplied { version }));
@@ -470,6 +478,36 @@ fn a_host_that_cant_run_its_first_graph_counts_as_a_crash() {
         compiled: first,
     }));
     link.until_status(EngineStatus::Restarting { attempt: 1 });
+}
+
+#[test]
+fn a_first_graph_refused_over_a_device_is_reported_not_a_crash() {
+    // The controller leaves the device out and sends another graph (see the actor).
+    let hosts = FakeHosts::default();
+    hosts.script.refuse_from.store(1, SeqCst);
+    hosts.script.blame_device.store(true, SeqCst);
+    let link = Link::start(hosts.clone(), fast());
+    let (first, ..) = graph_then_fader();
+    link.send(LinkMsg::Update(EngineUpdate::Graph {
+        version: 1,
+        compiled: first.clone(),
+    }));
+    link.until("the refusal", |r| {
+        matches!(
+            r,
+            EngineReport::Refused {
+                version: 1,
+                error: GraphError::Endpoint { .. }
+            }
+        )
+    });
+    hosts.script.refuse_from.store(0, SeqCst);
+    link.send(LinkMsg::Update(EngineUpdate::Graph {
+        version: 2,
+        compiled: first,
+    }));
+    link.until_status(running(2));
+    assert_eq!(hosts.count(), 1, "the same host all along");
 }
 
 // ---------------------------------------------------------------------------------------------

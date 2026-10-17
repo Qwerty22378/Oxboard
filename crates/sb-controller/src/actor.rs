@@ -15,19 +15,25 @@
 //! ([`crate::engine_link`]). Without a link (tests), [`Actor::engine_updates`] collects it.
 //! App levels changed in desired state go to the Windows side the same way ([`WinMsg`]).
 //!
+//! Desired state that changed goes to the persistence worker ([`crate::persist`]), which
+//! saves it a moment later; the outcome comes back as [`Msg::Saved`] and shows in the view.
+//!
 //! A device the engine loses while Windows still lists it (held exclusively, a driver
 //! hiccup) is left out of the graph and tried again after a wait that doubles each time,
 //! from 1 s to 30 s. The output clock moves to another output meanwhile.
 
 use crate::commands;
 use crate::compile::{Compiled, Continuity, Update, compile};
+use crate::driver::DriverJob;
 use crate::engine_link::{EngineReport, LinkMsg};
 use crate::hub::{ClientId, Hub};
-use crate::state::{AppState, Failed, Observation};
+use crate::persist::SaveMsg;
+use crate::routing::{Routing, Started};
+use crate::state::{AppState, Desired, Failed, Observation};
 use crate::view::project;
 use crate::watch::WinMsg;
 use sb_shared::events::EngineEvent;
-use sb_shared::graph::ClipAction;
+use sb_shared::graph::{ClipAction, GraphError, NodeId};
 use sb_shared::ui::{
     AppKey, ClipId, Command, EngineStatus, ErrorInfo, ErrorKind, Level, StateView, UiMessage, UiRequest, diff,
 };
@@ -59,6 +65,18 @@ pub enum Msg {
     ObservedAll(Vec<Observation>),
     /// From the engine link.
     Engine(EngineReport),
+    /// A driver job finished (`op` from the job).
+    DriverDone {
+        op: u64,
+        result: Result<(), String>,
+    },
+    /// A COM-thread job finished.
+    WinDone {
+        op: u64,
+        result: Result<(), String>,
+    },
+    /// The persistence worker wrote the settings (or couldn't).
+    Saved(Result<(), String>),
     /// Stop the actor (the controller is exiting).
     Stop,
 }
@@ -82,8 +100,13 @@ pub struct Actor {
     engine_updates: Vec<EngineUpdate>,
     engine: Option<Sender<LinkMsg>>,
     windows: Option<Sender<WinMsg>>,
+    driver: Option<Sender<DriverJob>>,
+    routing: Routing,
     /// App levels as last sent to Windows.
     sent_levels: BTreeMap<AppKey, Level>,
+    persist: Option<Sender<SaveMsg>>,
+    /// Desired state as last sent to be saved.
+    saved: Desired,
 }
 
 /// What the engine has to be told, in order.
@@ -109,7 +132,11 @@ impl Actor {
             engine_updates: Vec::new(),
             engine: None,
             windows: None,
+            driver: None,
+            routing: Routing::default(),
             sent_levels: BTreeMap::new(),
+            persist: None,
+            saved: Desired::default(),
         };
         a.recompile();
         a
@@ -130,8 +157,24 @@ impl Actor {
     /// Apply app levels through the Windows side (the COM thread): the current ones now, then
     /// every change.
     pub fn with_windows(mut self, win: Sender<WinMsg>) -> Self {
+        self.routing.set_windows(win.clone());
         self.windows = Some(win);
         self.sync_windows();
+        self
+    }
+
+    /// Manage the driver's endpoint pool through this worker (Interface 2).
+    pub fn with_driver(mut self, driver: Sender<DriverJob>) -> Self {
+        self.driver = Some(driver.clone());
+        self.routing.set_driver(driver);
+        self
+    }
+
+    /// Save desired state through this worker whenever it changes (it was just loaded, so it's
+    /// on disk already).
+    pub fn with_persist(mut self, persist: Sender<SaveMsg>) -> Self {
+        self.saved = self.state.desired.clone();
+        self.persist = Some(persist);
         self
     }
 
@@ -181,6 +224,13 @@ impl Actor {
         if let Some(w) = &self.windows {
             let _ = w.send(WinMsg::Stop);
         }
+        if let Some(d) = &self.driver {
+            let _ = d.send(DriverJob::Stop);
+        }
+        // The last change was sent with its message; this writes it now.
+        if let Some(p) = &self.persist {
+            let _ = p.send(SaveMsg::Stop);
+        }
         self.state
     }
 
@@ -220,7 +270,7 @@ impl Actor {
                     client,
                     UiMessage::Snapshot {
                         seq: self.seq,
-                        view: self.view.clone(),
+                        view: Box::new(self.view.clone()),
                     },
                 );
                 self.hub.subscribe(client);
@@ -230,11 +280,19 @@ impl Actor {
                 req: UiRequest::Command { id, cmd },
             } => {
                 self.hub.send(client, UiMessage::Accepted(id));
-                let reply = match self.command(cmd) {
-                    Ok(()) => UiMessage::Completed(id),
-                    Err(e) => UiMessage::Failed(id, e),
+                let started = match cmd {
+                    Command::RouteApp { app, outputs } => {
+                        self.routing.route_app(&mut self.state, client, id, app, outputs)
+                    }
+                    cmd => Started::Done(self.command(cmd)),
                 };
-                self.after_diff.push((client, reply));
+                if let Started::Done(result) = started {
+                    let reply = match result {
+                        Ok(()) => UiMessage::Completed(id),
+                        Err(e) => UiMessage::Failed(id, e),
+                    };
+                    self.after_diff.push((client, reply));
+                }
             }
             Msg::UiDisconnected { client } => {
                 self.hub.remove(client);
@@ -242,6 +300,25 @@ impl Actor {
             Msg::Observed(o) => self.state.observe(o),
             Msg::ObservedAll(all) => all.into_iter().for_each(|o| self.state.observe(o)),
             Msg::Engine(r) => self.engine_report(r),
+            Msg::DriverDone { op, result } => {
+                if let Some(reply) = self.routing.driver_done(&mut self.state, op, result) {
+                    self.after_diff.push(reply);
+                }
+            }
+            Msg::WinDone { op, result } => {
+                if let Some(reply) = self.routing.win_done(&mut self.state, op, result) {
+                    self.after_diff.push(reply);
+                }
+            }
+            Msg::Saved(result) => {
+                let error = result.err();
+                if self.log
+                    && let Some(e) = &error
+                {
+                    eprintln!("             can't save the settings: {e}");
+                }
+                self.state.observed.settings.save_error = error;
+            }
             Msg::Stop => {}
         }
         self.publish();
@@ -307,27 +384,43 @@ impl Actor {
                 }
             }
             EngineReport::Event(EngineEvent::DeviceLost { node }) => {
-                if let Some(key) = self.compiled.devices.get(&node) {
-                    let f = self.state.observed.failed.entry(key.clone()).or_insert(Failed {
-                        attempts: 0,
-                        retry_at: None,
-                    });
-                    // Lost again while out of the graph: an old graph's event.
-                    if f.retry_at.is_none() {
-                        f.attempts += 1;
-                        let wait = RETRY_FIRST.saturating_mul(1 << (f.attempts - 1).min(8)).min(RETRY_MAX);
-                        f.retry_at = Some(Instant::now() + wait);
-                        if self.log {
-                            eprintln!("             {} lost; trying again in {wait:?}", key.0);
-                        }
-                    }
-                }
+                self.device_failed(node, "lost");
             }
             // Xrun, MasterClockFallback: facts for the log. (The master moves on its own when
             // its device fails: the graph leaves the device out and picks another clock.)
             EngineReport::Event(_) => {}
+            // A device that won't open (Windows lists it, but it's held exclusively, or
+            // broken) makes the engine refuse the whole graph; the last one keeps playing.
+            // Leave the device out like a lost one, and the next graph goes through.
+            EngineReport::Refused {
+                error: GraphError::Endpoint { node, ref reason },
+                ..
+            } if self.compiled.devices.contains_key(&node) => {
+                let why = format!("won't open ({reason})");
+                self.device_failed(node, &why);
+            }
             EngineReport::Refused { version, error } => {
                 eprintln!("controller: BUG: the engine refused graph v{version}: {error}");
+            }
+        }
+    }
+
+    /// The engine couldn't use a device node's device: out of the graph, tried again later.
+    fn device_failed(&mut self, node: NodeId, why: &str) {
+        let Some(key) = self.compiled.devices.get(&node) else {
+            return;
+        };
+        let f = self.state.observed.failed.entry(key.clone()).or_insert(Failed {
+            attempts: 0,
+            retry_at: None,
+        });
+        // Again while out of the graph: about an old graph.
+        if f.retry_at.is_none() {
+            f.attempts += 1;
+            let wait = RETRY_FIRST.saturating_mul(1 << (f.attempts - 1).min(8)).min(RETRY_MAX);
+            f.retry_at = Some(Instant::now() + wait);
+            if self.log {
+                eprintln!("             {} {why}; trying again in {wait:?}", key.0);
             }
         }
     }
@@ -406,6 +499,13 @@ impl Actor {
             }
         }
         self.sync_windows();
+        self.routing.sync(&self.state);
+        if let Some(p) = &self.persist
+            && self.state.desired != self.saved
+        {
+            self.saved = self.state.desired.clone();
+            let _ = p.send(SaveMsg::Save(Box::new(self.saved.clone())));
+        }
         let view = project(&self.state);
         let ops = diff(&self.view, &view);
         if !ops.is_empty() {
@@ -702,6 +802,94 @@ mod tests {
         }));
         assert_eq!(a.next_retry(), None);
         assert!(a.compiled().devices.values().any(|k| *k == speakers()));
+    }
+
+    #[test]
+    fn a_graph_refused_over_a_device_is_sent_again_without_it() {
+        let (mut a, _hub) = with_speakers();
+        a.handle(Msg::Observed(Observation::DeviceAdded {
+            key: mic(),
+            info: DeviceInfo {
+                name: "Mic".into(),
+                flow: Flow::Capture,
+            },
+        }));
+        a.handle(cmd(
+            1,
+            1,
+            Command::SetSystemInput(Some(sb_shared::ui::SystemInput::Device(mic()))),
+        ));
+        a.handle(cmd(
+            1,
+            2,
+            Command::SelectOutput {
+                device: speakers(),
+                selected: true,
+            },
+        ));
+        a.engine_updates();
+        let node = *a.compiled().devices.iter().find(|(_, k)| **k == speakers()).unwrap().0;
+        a.handle(Msg::Engine(EngineReport::Refused {
+            version: a.state().graph_version,
+            error: GraphError::Endpoint {
+                node,
+                reason: "Element not found.".into(),
+            },
+        }));
+        assert!(project(a.state()).devices[&speakers()].failed);
+        let updates = a.engine_updates();
+        assert!(
+            matches!(&updates[..], [EngineUpdate::Graph { compiled, .. }] if !compiled.devices.values().any(|k| *k == speakers())),
+            "a new graph without it: {updates:?}"
+        );
+        assert!(a.next_retry().is_some());
+        // A refusal that names no device is still a bug, and changes nothing.
+        a.handle(Msg::Engine(EngineReport::Refused {
+            version: 9,
+            error: GraphError::UnknownNode { edge: 0, node },
+        }));
+        assert!(a.engine_updates().is_empty());
+    }
+
+    #[test]
+    fn changed_settings_are_sent_to_be_saved_and_failures_shown() {
+        let (a, hub) = with_speakers();
+        let (tx, rx) = mpsc::channel();
+        let mut a = a.with_persist(tx);
+        let ui = connect(&hub, 1, 64);
+        a.handle(subscribe(1));
+        a.handle(cmd(1, 1, Command::SetMasterGain(0.5)));
+        let saves: Vec<_> = rx.try_iter().collect();
+        assert!(
+            matches!(&saves[..], [SaveMsg::Save(d)] if d.master.gain == 0.5 && **d == a.state().desired),
+            "{saves:?}"
+        );
+        // What Windows shows isn't a setting; a failed command changes nothing.
+        a.handle(Msg::Observed(Observation::DeviceRemoved { key: speakers() }));
+        a.handle(cmd(1, 2, Command::SetMasterGain(9.0)));
+        assert!(rx.try_recv().is_err());
+
+        ui.drain();
+        a.handle(Msg::Saved(Err("disk full".into())));
+        a.handle(Msg::Saved(Err("disk full".into())));
+        let msgs = ui.drain();
+        assert_eq!(msgs.len(), 1, "said once: {msgs:?}");
+        assert_eq!(project(a.state()).settings.save_error.as_deref(), Some("disk full"));
+        a.handle(Msg::Saved(Ok(())));
+        assert_eq!(project(a.state()).settings.save_error, None);
+    }
+
+    #[test]
+    fn a_load_error_shows_until_dismissed() {
+        let mut state = AppState::default();
+        state.observed.settings.load_error = Some(sb_shared::ui::LoadError {
+            reason: "line 3".into(),
+            backup: Some("config.toml.bad-1".into()),
+        });
+        let mut a = Actor::new(state, Arc::new(Hub::default()));
+        assert!(project(a.state()).settings.load_error.is_some());
+        a.handle(cmd(1, 1, Command::DismissLoadError));
+        assert_eq!(project(a.state()).settings.load_error, None);
     }
 
     #[test]

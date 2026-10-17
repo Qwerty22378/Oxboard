@@ -13,7 +13,7 @@ pub const fn ctl_code(device: u32, function: u32, method: u32, access: u32) -> u
 }
 
 /// Custom function codes start at 0x800.
-const fn sb(function: u32) -> u32 {
+pub(crate) const fn sb(function: u32) -> u32 {
     ctl_code(DEVICE_SOUND, 0x800 + function, METHOD_BUFFERED, FILE_READ_WRITE)
 }
 

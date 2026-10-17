@@ -90,7 +90,7 @@ mod win {
                         device: speakers.into(),
                     },
                 ),
-                n(5, NodeKind::VirtualMic { endpoint: 2 }),
+                n(5, NodeKind::VirtualMic { endpoint: 9 }),
             ],
             edges: vec![
                 e(1, 3, Some(TONE_GAIN)),

@@ -13,7 +13,9 @@
 //! `SB_WATCH_TRACE=1` prints every scan that changed something and every level set.
 
 use crate::actor::{Inbox, Msg};
+use crate::state::Observation;
 use crate::watch::{self, Levels, SeenDevice, SeenSession, WinMsg, World};
+use crate::win::policy::Policy;
 use sb_shared::ui::{AppKey, DeviceKey, Flow, Level};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -71,8 +73,17 @@ fn run(rx: Receiver<WinMsg>, wake: Sender<WinMsg>, inbox: Inbox) -> Result<()> {
     let en: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
     let client: IMMNotificationClient = DeviceEvents { wake: wake.clone() }.into();
     unsafe { en.RegisterEndpointNotificationCallback(&client)? };
+    let policy = match Policy::new() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("windows watcher: per-app outputs unavailable: {e}");
+            None
+        }
+    };
+    let _ = inbox.send(Msg::Observed(Observation::AppRouting(policy.is_some())));
     let mut w = Watcher {
         en,
+        policy,
         wake,
         inbox,
         managers: BTreeMap::new(),
@@ -99,6 +110,15 @@ fn run(rx: Receiver<WinMsg>, wake: Sender<WinMsg>, inbox: Inbox) -> Result<()> {
         for m in msgs {
             match m {
                 WinMsg::SetAppLevel { app, level } => w.set_level(app, level),
+                WinMsg::SetAppOutput { op, app, pids, device } => {
+                    let result = w.set_output(&app, &pids, device.as_ref());
+                    if op != 0 {
+                        let _ = w.inbox.send(Msg::WinDone { op, result });
+                    } else if let Err(e) = result {
+                        eprintln!("windows watcher: sending {} to its endpoint: {e}", app.0);
+                    }
+                    sessions = true;
+                }
                 WinMsg::Rescan {
                     devices: d,
                     sessions: s,
@@ -153,6 +173,7 @@ struct Watcher {
     apps: HashMap<u32, Option<(AppKey, String)>>,
     levels: Levels,
     trace: bool,
+    policy: Option<Policy>,
     /// As last reported.
     world: World,
 }
@@ -264,8 +285,8 @@ impl Watcher {
     /// level the controller wants for their app); ended ones lose them.
     fn sessions(&mut self) -> BTreeMap<String, SeenSession> {
         let mut out = BTreeMap::new();
-        let mut live: HashMap<String, (IAudioSessionControl, IAudioSessionControl2)> = HashMap::new();
-        for m in self.managers.values() {
+        let mut live: HashMap<String, (IAudioSessionControl, IAudioSessionControl2, DeviceKey)> = HashMap::new();
+        for (device, m) in &self.managers {
             let Ok(list) = (unsafe { m.mgr.GetSessionEnumerator() }) else {
                 continue;
             };
@@ -285,12 +306,12 @@ impl Watcher {
                 let Ok(id) = (unsafe { c2.GetSessionInstanceIdentifier() }).map(take_string) else {
                     continue;
                 };
-                live.insert(id, (control, c2));
+                live.insert(id, (control, c2, device.clone()));
             }
         }
         let pids: HashMap<String, u32> = live
             .iter()
-            .filter_map(|(id, (_, c2))| unsafe { c2.GetProcessId() }.ok().map(|p| (id.clone(), p)))
+            .filter_map(|(id, (_, c2, _))| unsafe { c2.GetProcessId() }.ok().map(|p| (id.clone(), p)))
             .collect();
         self.apps.retain(|pid, _| pids.values().any(|p| p == pid));
 
@@ -305,7 +326,7 @@ impl Watcher {
                 let _ = unsafe { t.control.UnregisterAudioSessionNotification(&t.events) };
             }
         }
-        for (id, (control, c2)) in live {
+        for (id, (control, c2, device)) in live {
             let Some(&pid) = pids.get(&id).filter(|p| **p != 0) else {
                 continue;
             };
@@ -341,7 +362,16 @@ impl Watcher {
             };
             let display = unsafe { control.GetDisplayName() }.map(take_string).unwrap_or_default();
             let name = watch::usable_display_name(&display).map_or(exe_name, str::to_owned);
-            out.insert(id, SeenSession { app, name, pid, level });
+            out.insert(
+                id,
+                SeenSession {
+                    app,
+                    device,
+                    name,
+                    pid,
+                    level,
+                },
+            );
         }
         out
     }
@@ -362,6 +392,21 @@ impl Watcher {
                 Some((AppKey(path), name))
             })
             .clone()
+    }
+
+    /// Point the app's processes at `device` (or back at the default).
+    fn set_output(&self, app: &AppKey, pids: &[u32], device: Option<&DeviceKey>) -> std::result::Result<(), String> {
+        let policy = self
+            .policy
+            .as_ref()
+            .ok_or("this Windows doesn't support per-app outputs")?;
+        for pid in pids {
+            policy.set(*pid, device)?;
+        }
+        if self.trace {
+            eprintln!("watch: {} ({pids:?}) → {device:?}", app.0);
+        }
+        Ok(())
     }
 
     fn set_level(&mut self, app: AppKey, level: Level) {

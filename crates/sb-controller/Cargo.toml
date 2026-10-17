@@ -7,7 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sb-ring.workspace = true   # the driver's control-plane ABI
 sb-shared.workspace = true
+serde.workspace = true
+toml.workspace = true   # settings (persist.rs)
 
 [target.'cfg(windows)'.dependencies]
 sb-pipe.workspace = true
@@ -16,14 +19,18 @@ windows-core.workspace = true
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true
 features = [
+    "Win32_Devices_DeviceAndDriverInstallation",  # CM_Get_Device_Interface_List: finding the driver
     "Win32_Devices_FunctionDiscovery",  # PKEY_Device_FriendlyName, PKEY_DeviceInterface_FriendlyName
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Storage_FileSystem",         # version resources: an app's "File description"
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_IO",                  # DeviceIoControl
+    "Win32_System_Registry",            # the Windows build, for the per-app output API
     "Win32_System_Threading",           # OpenProcess, QueryFullProcessImageNameW
     "Win32_System_Variant",
+    "Win32_System_WinRT",               # RoGetActivationFactory: AudioPolicyConfig
     "Win32_UI_Shell_PropertiesSystem",
 ]
 

@@ -386,7 +386,10 @@ pub(crate) mod tests {
         for id in 1..=3 {
             s.observe(Observation::Endpoint {
                 id,
-                state: Some(PoolEndpoint { enabled: true }),
+                state: Some(PoolEndpoint {
+                    enabled: true,
+                    ..Default::default()
+                }),
             });
         }
         s
@@ -487,7 +490,10 @@ pub(crate) mod tests {
         assert!(c.meters.values().any(|t| *t == MeterTarget::System));
         s.observe(Observation::Endpoint {
             id: 3,
-            state: Some(PoolEndpoint { enabled: false }),
+            state: Some(PoolEndpoint {
+                enabled: false,
+                ..Default::default()
+            }),
         });
         assert!(
             compiled(&s).graph.nodes.is_empty(),
@@ -537,7 +543,10 @@ pub(crate) mod tests {
         run(&mut s, Command::SetMasterGain(0.8));
         s.observe(Observation::Endpoint {
             id: 2,
-            state: Some(PoolEndpoint { enabled: false }),
+            state: Some(PoolEndpoint {
+                enabled: false,
+                ..Default::default()
+            }),
         });
         assert_eq!(
             edges(&compiled(&s)),
@@ -863,6 +872,7 @@ pub(crate) mod tests {
                             id: 1 + r.below(3) as u32,
                             state: Some(PoolEndpoint {
                                 enabled: r.below(2) == 0,
+                                ..Default::default()
                             }),
                         }),
                         _ => {

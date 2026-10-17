@@ -189,8 +189,12 @@ fn change(state: &mut AppState, cmd: Command) -> Outcome {
                 None => return Err(not_found(format!("no clip {}", id.0))),
             }
         }
-        Command::PlayClip { .. } | Command::StopClip { .. } | Command::RestartEngine => {
-            return Err(ErrorInfo::new(ErrorKind::Internal, "the actor runs engine commands"));
+        Command::DismissLoadError => state.observed.settings.load_error = None,
+        Command::PlayClip { .. } | Command::StopClip { .. } | Command::RestartEngine | Command::RouteApp { .. } => {
+            return Err(ErrorInfo::new(
+                ErrorKind::Internal,
+                "the actor runs engine and routing commands",
+            ));
         }
     }
     state.desired.prune_known();

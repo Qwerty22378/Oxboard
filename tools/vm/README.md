@@ -43,6 +43,8 @@ tools/vm/win-cargo.sh build --release -p sb-engine-host --bins --examples   # E9
 tools/vm/win-cargo.sh build --release -p sb-controller --bins --examples   # C1: on sb-build, start target\release\sb-controller.exe --fake-devices --log, then examples\ctl.exe show | watch | select ... (see ctl.rs)
 tools/vm/win-cargo.sh build --release -p sb-controller -p sb-engine-host --bins --examples   # C3: sb-controller.exe --fake-devices --fake-driver --log runs the host next to it; ctl play 0, Stop-Process -Name sb-engine-host, ctl restart-engine
 tools/vm/win-cargo.sh test -p sb-controller --test windows_watch   # C4: the real COM thread (devices, this test as an app, levels both ways); sb-controller.exe --log now shows the real devices and apps
+tools/vm/win-cargo.sh test -p sb-controller --test windows_policy   # C5: a child process sent to the non-default output (per-app outputs); examples\app_output.exe PID [DEVICE|default]; sb-controller.exe --fake-driver, then ctl send APP OUTPUT
+tools/vm/win-cargo.sh test -p sb-controller --test ui_link   # C6: settings outlive the controller; sb-controller.exe saves to %APPDATA%\Soundboard\config.toml (--config FILE, --no-config), ctl dismiss clears a load error
 ```
 
 Other commands: `vm.sh status | start | stop | ssh <role> [cmd] | view <role> | seal | revert | password`.
