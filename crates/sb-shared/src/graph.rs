@@ -4,22 +4,23 @@
 //! Every node has one stereo output, except sinks. Buses and sinks are mix points: their
 //! input is the sum of their incoming edges, each scaled by its gain.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Stable node identity. The controller derives it from its own keys, so an unchanged node
 /// keeps its id (and later its state) across graph updates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u32);
 
 /// A parameter slot (edge gains so far). Values change without a graph rebuild.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ParamId(pub u32);
 
 /// A meter slot: peak and RMS of one node's output, read by the controller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MeterId(pub u32);
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GraphSpec {
     pub nodes: Vec<NodeSpec>,
     pub edges: Vec<EdgeSpec>,
@@ -32,13 +33,13 @@ pub struct GraphSpec {
     pub master: Option<NodeId>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeSpec {
     pub id: NodeId,
     pub kind: NodeKind,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NodeKind {
     /// Source: a capture endpoint, by WASAPI endpoint ID.
     DeviceInput { device: String },
@@ -48,19 +49,61 @@ pub enum NodeKind {
     Bus,
     /// Sink and mix point: a render endpoint, by WASAPI endpoint ID.
     DeviceOutput { device: String },
+    /// Source: what apps play into one of the driver's virtual render endpoints, by the
+    /// driver's endpoint id (the controller enables and names it).
+    VirtualSource { endpoint: u32 },
+    /// Sink and mix point: a virtual microphone; apps capture what the engine writes here.
+    VirtualMic { endpoint: u32 },
+    /// Source: a sound file, played when triggered (`Engine::trigger`). The engine loads and
+    /// decodes it itself; changing the settings keeps playing voices, a new path is a new node.
+    Clip {
+        path: String,
+        polyphony: u8,
+        retrigger: Retrigger,
+        looped: bool,
+    },
+}
+
+/// What a clip does when it's triggered while already playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Retrigger {
+    /// Fade out what's playing and start again from the top.
+    Restart,
+    /// Start another voice on top (up to `polyphony`; past that the oldest fades out).
+    Overlap,
+    /// Keep playing; ignore the trigger.
+    Ignore,
+}
+
+/// One-shot actions on a clip node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipAction {
+    Play,
+    /// Fade out every voice.
+    Stop,
+    /// Jump every voice to `frame` (48 kHz frames from the start), with a short crossfade.
+    Seek {
+        frame: u64,
+    },
 }
 
 impl NodeKind {
     pub fn is_source(&self) -> bool {
-        matches!(self, NodeKind::DeviceInput { .. } | NodeKind::Tone { .. })
+        matches!(
+            self,
+            NodeKind::DeviceInput { .. }
+                | NodeKind::Tone { .. }
+                | NodeKind::VirtualSource { .. }
+                | NodeKind::Clip { .. }
+        )
     }
 
     pub fn is_sink(&self) -> bool {
-        matches!(self, NodeKind::DeviceOutput { .. })
+        matches!(self, NodeKind::DeviceOutput { .. } | NodeKind::VirtualMic { .. })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EdgeSpec {
     pub from: NodeId,
     pub to: NodeId,
@@ -70,27 +113,27 @@ pub struct EdgeSpec {
 
 /// A param an edge refers to. `value` is written to the engine's param table when the graph
 /// is applied; afterwards `set_param` changes it without a rebuild.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ParamSpec {
     pub id: ParamId,
     pub value: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MeterSpec {
     pub id: MeterId,
     /// For a bus or sink, the meter reads its mixed input.
     pub node: NodeId,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GraphError {
     DuplicateNode(NodeId),
     DuplicateParam(ParamId),
     DuplicateMeter(MeterId),
     /// A param or meter id is past the end of the engine's fixed-size table.
     IdOutOfRange {
-        kind: &'static str,
+        kind: IdKind,
         id: u32,
         capacity: usize,
     },
@@ -132,6 +175,27 @@ pub enum GraphError {
     },
     /// The engine's queue of pending plans is full (the mix thread isn't adopting them).
     Busy,
+    /// A clip couldn't be loaded or decoded.
+    Clip {
+        node: NodeId,
+        reason: String,
+    },
+}
+
+/// Which fixed-size table an out-of-range id was meant for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdKind {
+    Param,
+    Meter,
+}
+
+impl fmt::Display for IdKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            IdKind::Param => "param",
+            IdKind::Meter => "meter",
+        })
+    }
 }
 
 impl fmt::Display for GraphError {
@@ -156,6 +220,7 @@ impl fmt::Display for GraphError {
             InvalidValue(what) => write!(f, "invalid value: {what}"),
             Endpoint { node, reason } => write!(f, "node {}: {reason}", node.0),
             Busy => write!(f, "engine busy: too many graph updates pending"),
+            Clip { node, reason } => write!(f, "clip node {}: {reason}", node.0),
         }
     }
 }

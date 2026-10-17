@@ -16,6 +16,7 @@ use crate::graph::compile::{Endpoints, Layout, Mode, Tables, compile_against};
 use crate::graph::plan::PlanBuilder;
 use crate::graph::spec::{GraphError, GraphSpec, NodeKind, ParamId};
 use crate::rt::mix_thread::{MixCore, PlanQueue, plan_channel};
+use sb_shared::events::EngineEvent;
 use std::collections::VecDeque;
 
 pub struct Engine<E: Endpoints> {
@@ -27,6 +28,12 @@ pub struct Engine<E: Endpoints> {
     layouts: VecDeque<Layout>,
     /// The last spec applied; settle plans are compiled from it.
     spec: GraphSpec,
+    /// Graph version of each entry in `layouts` (settle plans repeat their transition's).
+    versions: VecDeque<Option<u64>>,
+    /// Last version reported as applied.
+    applied: Option<u64>,
+    /// Events raised on the control side (graph applied, device lost), for `poll_events`.
+    events: Vec<EngineEvent>,
 }
 
 impl<E: Endpoints> Engine<E> {
@@ -53,6 +60,9 @@ impl<E: Endpoints> Engine<E> {
                 queue,
                 layouts,
                 spec: GraphSpec::default(),
+                versions: VecDeque::from([None]),
+                applied: None,
+                events: Vec::new(),
             },
             core,
         )
@@ -68,6 +78,36 @@ impl<E: Endpoints> Engine<E> {
 
     pub fn endpoints_mut(&mut self) -> &mut E {
         &mut self.endpoints
+    }
+
+    /// A one-shot action on a clip node (play, stop, seek). Lock-free; applied at the next
+    /// block. `false` if the command queue is full.
+    pub fn trigger(&mut self, node: crate::graph::spec::NodeId, action: crate::graph::spec::ClipAction) -> bool {
+        self.queue
+            .commands
+            .push(crate::rt::mix_thread::Command { node, action })
+            .is_ok()
+    }
+
+    /// Events the mix has reported since the last call.
+    ///
+    /// Control-side events first (`GraphApplied` as seen by the last `maintain`, `DeviceLost`
+    /// from the endpoints), then the mix thread's (`ClipEnded`).
+    pub fn poll_events(&mut self) -> Vec<EngineEvent> {
+        let mut out = std::mem::take(&mut self.events);
+        out.extend(
+            self.endpoints
+                .take_lost()
+                .into_iter()
+                .map(|node| EngineEvent::DeviceLost { node }),
+        );
+        out.extend(std::iter::from_fn(|| self.queue.events.pop().ok()));
+        out
+    }
+
+    /// The graph version the mix thread is running (as of the last `maintain`).
+    pub fn applied_version(&self) -> Option<u64> {
+        self.applied
     }
 
     /// Move a param. Lock-free, no rebuild, smoothed on the audio thread.
@@ -92,6 +132,16 @@ impl<E: Endpoints> Engine<E> {
 
     /// Replace the graph. On error the running graph is untouched and nothing stays opened.
     pub fn apply_graph(&mut self, spec: &GraphSpec) -> Result<(), GraphError> {
+        self.apply(spec, None)
+    }
+
+    /// [`Engine::apply_graph`], tagged with the controller's `version`: once the mix thread
+    /// runs it, `poll_events` reports `GraphApplied { version }`.
+    pub fn apply_graph_versioned(&mut self, spec: &GraphSpec, version: u64) -> Result<(), GraphError> {
+        self.apply(spec, Some(version))
+    }
+
+    fn apply(&mut self, spec: &GraphSpec, version: Option<u64>) -> Result<(), GraphError> {
         self.maintain();
         if self.queue.incoming.slots() == 0 {
             return Err(GraphError::Busy);
@@ -109,7 +159,7 @@ impl<E: Endpoints> Engine<E> {
             prev,
             Mode::Transition,
         )?;
-        self.submit(c.plan, c.layout);
+        self.submit(c.plan, c.layout, version);
         self.spec = spec.clone();
         Ok(())
     }
@@ -121,9 +171,16 @@ impl<E: Endpoints> Engine<E> {
         while let Ok(old) = self.queue.retired.pop() {
             drop(old);
             let Some(gone) = self.layouts.pop_front() else { continue };
+            self.versions.pop_front();
+            if let Some(&Some(v)) = self.versions.front()
+                && self.applied != Some(v)
+            {
+                self.applied = Some(v);
+                self.events.push(EngineEvent::GraphApplied { version: v });
+            }
             for key in gone.endpoint_keys() {
                 if !self.layouts.iter().any(|l| l.uses_endpoint(key)) {
-                    self.endpoints.release(key);
+                    crate::graph::compile::release(key, &self.tables, &mut self.endpoints);
                 }
             }
         }
@@ -138,13 +195,15 @@ impl<E: Endpoints> Engine<E> {
                 prev,
                 Mode::Settle,
             ) {
-                self.submit(c.plan, c.layout);
+                let version = *self.versions.back().expect("never empty");
+                self.submit(c.plan, c.layout, version);
             }
         }
     }
 
-    fn submit(&mut self, plan: crate::graph::plan::RenderPlan, layout: Layout) {
+    fn submit(&mut self, plan: crate::graph::plan::RenderPlan, layout: Layout, version: Option<u64>) {
         self.layouts.push_back(layout);
+        self.versions.push_back(version);
         if self.queue.incoming.push(Box::new(plan)).is_err() {
             unreachable!("a free slot was checked before compiling");
         }
@@ -163,6 +222,24 @@ pub fn start_wasapi(
     crate::rt::mix_thread::MixThread,
 )> {
     let endpoints = crate::backend::wasapi::WasapiEndpoints::new(block);
+    let (engine, core) = Engine::with_master(block, tables, endpoints, master);
+    let mix = crate::rt::mix_thread::spawn(core)?;
+    Ok((engine, mix))
+}
+
+/// [`start_wasapi`], plus the driver's virtual endpoints served through `link` (the real
+/// driver's IOCTL link arrives with D6; `backend::driver::FakeDriver` plays it until then).
+#[cfg(all(windows, feature = "driver"))]
+pub fn start_wasapi_with_driver(
+    block: usize,
+    tables: Tables,
+    master: Option<&str>,
+    link: Box<dyn crate::backend::driver::DriverLink>,
+) -> windows::core::Result<(
+    Engine<crate::backend::wasapi::WasapiEndpoints>,
+    crate::rt::mix_thread::MixThread,
+)> {
+    let endpoints = crate::backend::wasapi::WasapiEndpoints::new(block).with_driver(link);
     let (engine, core) = Engine::with_master(block, tables, endpoints, master);
     let mix = crate::rt::mix_thread::spawn(core)?;
     Ok((engine, mix))
@@ -202,7 +279,11 @@ mod tests {
 
     impl Rig {
         fn new() -> Self {
-            let (engine, core) = Engine::new(BLOCK, Tables::new(1024, 16), FakeEndpoints::default());
+            Self::with_tables(Tables::new(1024, 16))
+        }
+
+        fn with_tables(tables: Tables) -> Self {
+            let (engine, core) = Engine::new(BLOCK, tables, FakeEndpoints::default());
             Self {
                 engine,
                 core,
@@ -653,5 +734,197 @@ mod tests {
                 "case {case}: leaked endpoints"
             );
         }
+    }
+
+    // ---- clips (E8) ----
+
+    use crate::clips::ClipStore;
+    use crate::clips::decode::tests::{tmp, write_wav};
+    use crate::graph::spec::{ClipAction, Retrigger};
+
+    fn clip_node(id: u32, path: &std::path::Path, retrigger: Retrigger, looped: bool) -> NodeSpec {
+        crate::testing::node(
+            id,
+            NodeKind::Clip {
+                path: path.to_string_lossy().into(),
+                polyphony: 4,
+                retrigger,
+                looped,
+            },
+        )
+    }
+
+    /// A 48 kHz mono WAV of a slow ramp (sample i = i / n · 0.9), so positions are readable.
+    fn ramp_wav(name: &str, n: usize) -> std::path::PathBuf {
+        let p = tmp(name);
+        write_wav(
+            &p,
+            48_000,
+            1,
+            &(0..n).map(|i| i as f32 / n as f32 * 0.9).collect::<Vec<_>>(),
+        );
+        p
+    }
+
+    #[test]
+    fn clip_plays_on_trigger_right_after_apply_and_reports_the_end() {
+        let path = ramp_wav("e8-short.wav", 4800);
+        let mut rig = Rig::new();
+        rig.apply(&spec(
+            vec![clip_node(1, &path, Retrigger::Restart, false), output(2, "spk")],
+            vec![edge(1, 2)],
+            2,
+        ));
+        assert!(
+            rig.engine.trigger(NodeId(1), ClipAction::Play),
+            "before the plan even runs"
+        );
+        let out = left(&rig.run(100));
+        let first = out.iter().position(|&v| v > 0.0).expect("the clip played");
+        assert!(first < 2 * BLOCK, "started within a block or two (at {first})");
+        // The ramp's sample 0 is 0, so `first` is its second sample: it ends at first + 4799.
+        assert!((out[first + 4798] - 4799.0 / 4800.0 * 0.9).abs() < 1e-4, "last frame");
+        assert!(out[first + 4799..].iter().all(|&v| v == 0.0), "silence after the end");
+        assert_eq!(
+            rig.engine.poll_events(),
+            vec![EngineEvent::ClipEnded {
+                node: NodeId(1),
+                stopped: false
+            }]
+        );
+    }
+
+    #[test]
+    fn a_playing_clip_survives_graph_changes_and_settings_changes() {
+        let path = ramp_wav("e8-long-ish.wav", 48_000);
+        let mut rig = Rig::new();
+        let base = spec(
+            vec![clip_node(1, &path, Retrigger::Restart, false), output(2, "spk")],
+            vec![edge(1, 2)],
+            2,
+        );
+        rig.apply(&base);
+        rig.settle();
+        rig.engine.trigger(NodeId(1), ClipAction::Play);
+        let mut out = left(&rig.run(20));
+        // Unrelated change (adds an output), then a settings change (loop on).
+        let mut more = base.clone();
+        more.nodes.push(output(3, "cable"));
+        more.edges.push(edge(1, 3));
+        rig.apply(&more);
+        out.extend(left(&rig.run(20)));
+        more.nodes[0] = clip_node(1, &path, Retrigger::Overlap, true);
+        rig.apply(&more);
+        out.extend(left(&rig.run(20)));
+        // The ramp kept climbing smoothly through both swaps: one step per sample.
+        let start = out.iter().position(|&v| v > 0.0).unwrap();
+        let ramp = &out[start..];
+        let step = 0.9 / 48_000.0;
+        assert!(
+            ramp.windows(2).all(|w| ((w[1] - w[0]) - step).abs() < 1e-4),
+            "position jumped"
+        );
+        assert!(rig.engine.poll_events().is_empty(), "never ended or restarted");
+    }
+
+    #[test]
+    fn streamed_clip_plays_exactly_like_the_decoded_file_and_releases_its_streamer() {
+        // 2 s of a 44.1 kHz sine: with a 0.5 s threshold it streams, 0.2 s head in memory.
+        let path = tmp("e8-stream.wav");
+        let sine: Vec<f32> = (0..88_200)
+            .map(|i| ((i as f64 * 440.0 / 44_100.0) * std::f64::consts::TAU).sin() as f32 * 0.5)
+            .collect();
+        write_wav(&path, 44_100, 1, &sine);
+        let (whole, _) = crate::clips::decode::decode(&path, None).unwrap();
+
+        let mut rig = Rig::with_tables(Tables::with_clips(16, 16, ClipStore::new(0.5, 0.2)));
+        let s = spec(
+            vec![clip_node(1, &path, Retrigger::Restart, false), output(2, "spk")],
+            vec![edge(1, 2)],
+            2,
+        );
+        rig.apply(&s);
+        rig.settle();
+        assert_eq!(rig.engine.tables().clips.streams(), 1, "a streamer for the node");
+        rig.engine.trigger(NodeId(1), ClipAction::Play);
+        let mut out = left(&rig.run(1));
+        std::thread::sleep(std::time::Duration::from_millis(300)); // the streamer decodes ahead
+        out.extend(left(&rig.run(whole.len() / BLOCK + 4)));
+        let start = out.iter().position(|&v| v != 0.0).unwrap_or(0).saturating_sub(1);
+        for (i, f) in whole.iter().enumerate() {
+            assert!(
+                (out[start + i] - f[0]).abs() < 1e-6,
+                "frame {i}: {} vs {}",
+                out[start + i],
+                f[0]
+            );
+        }
+        assert_eq!(
+            rig.engine.poll_events(),
+            vec![EngineEvent::ClipEnded {
+                node: NodeId(1),
+                stopped: false
+            }]
+        );
+
+        rig.apply(&spec(vec![output(2, "spk")], vec![], 2));
+        rig.settle();
+        assert_eq!(
+            rig.engine.tables().clips.streams(),
+            0,
+            "streamer released with the node"
+        );
+    }
+
+    #[test]
+    fn missing_clip_file_is_a_graph_error() {
+        let mut rig = Rig::new();
+        let s = spec(
+            vec![
+                clip_node(1, std::path::Path::new("/no/such/clip.ogg"), Retrigger::Restart, false),
+                output(2, "spk"),
+            ],
+            vec![edge(1, 2)],
+            2,
+        );
+        assert!(matches!(
+            rig.engine.apply_graph(&s),
+            Err(GraphError::Clip { node: NodeId(1), .. })
+        ));
+    }
+
+    #[test]
+    fn graph_applied_fires_once_per_version_when_the_mix_runs_it() {
+        let mut rig = Rig::new();
+        let applied = |rig: &mut Rig| -> Vec<u64> {
+            rig.engine
+                .poll_events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    EngineEvent::GraphApplied { version } => Some(version),
+                    _ => None,
+                })
+                .collect()
+        };
+        let a = spec(vec![tone(1, 440.0, 0.1), output(2, "spk")], vec![edge(1, 2)], 2);
+        rig.engine.apply_graph_versioned(&a, 1).unwrap();
+        assert!(applied(&mut rig).is_empty(), "not before the mix adopts it");
+        rig.settle(); // transition + settle plan: still one event
+        assert_eq!(applied(&mut rig), vec![1]);
+        assert_eq!(rig.engine.applied_version(), Some(1));
+
+        let mut b = a.clone();
+        b.nodes.push(tone(3, 660.0, 0.1));
+        b.edges.push(edge(3, 2));
+        rig.engine.apply_graph_versioned(&b, 2).unwrap();
+        rig.settle();
+        assert_eq!(applied(&mut rig), vec![2]);
+
+        let mut bad = b.clone();
+        bad.edges.push(edge(9, 2));
+        assert!(rig.engine.apply_graph_versioned(&bad, 3).is_err());
+        rig.settle();
+        assert!(applied(&mut rig).is_empty(), "a rejected graph is never applied");
+        assert_eq!(rig.engine.applied_version(), Some(2));
     }
 }

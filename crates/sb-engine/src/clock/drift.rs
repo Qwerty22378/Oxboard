@@ -19,7 +19,6 @@ use std::sync::{Arc, OnceLock};
 
 /// Filter length. Latency is about half of it (~0.7 ms).
 pub const TAPS: usize = 64;
-const HALF: usize = TAPS / 2;
 const PHASES: usize = 512;
 /// Cutoff in cycles per sample (0.5 = Nyquist): 21.6 kHz at 48 kHz.
 const CUTOFF: f64 = 0.45;
@@ -46,71 +45,109 @@ const STALL_HOLDOFF_NS: u64 = 1_000_000_000;
 /// After a re-anchor, the setpoint offset fades out with this time constant.
 const REANCHOR_TAU_S: f64 = 60.0;
 
-/// Polyphase table: `PHASES + 1` rows of `TAPS` coefficients, shared by every resampler.
-fn kernel() -> Arc<[f32]> {
-    static TABLE: OnceLock<Arc<[f32]>> = OnceLock::new();
-    TABLE
-        .get_or_init(|| {
-            let bessel_i0 = |x: f64| {
-                // Power series; converges fast for the arguments used here.
-                let (mut sum, mut term) = (1.0, 1.0);
-                for k in 1..50 {
-                    term *= (x / 2.0) * (x / 2.0) / (k * k) as f64;
-                    sum += term;
-                }
-                sum
-            };
-            let norm = bessel_i0(KAISER_BETA);
-            let mut t = Vec::with_capacity((PHASES + 1) * TAPS);
-            for p in 0..=PHASES {
-                let phase = p as f64 / PHASES as f64;
-                let row: Vec<f64> = (0..TAPS)
-                    .map(|i| {
-                        let x = i as f64 - (HALF - 1) as f64 - phase; // distance from the output point
-                        let arg = 2.0 * CUTOFF * x;
-                        let sinc = if arg.abs() < 1e-12 {
-                            1.0
-                        } else {
-                            (std::f64::consts::PI * arg).sin() / (std::f64::consts::PI * arg)
-                        };
-                        let w = (x / HALF as f64).clamp(-1.0, 1.0);
-                        sinc * bessel_i0(KAISER_BETA * (1.0 - w * w).sqrt()) / norm
-                    })
-                    .collect();
-                let sum: f64 = row.iter().sum();
-                t.extend(row.iter().map(|c| (c / sum) as f32));
+/// A polyphase windowed-sinc kernel: `phases + 1` rows of `taps` coefficients, each row
+/// normalized to unity DC gain.
+#[derive(Clone)]
+pub struct Kernel {
+    table: Arc<[f32]>,
+    taps: usize,
+}
+
+impl Kernel {
+    /// The drift kernel (ratio ≈ 1): 64 taps, cutoff 0.45, shared by every drift resampler.
+    pub fn drift() -> Self {
+        static TABLE: OnceLock<Arc<[f32]>> = OnceLock::new();
+        let table = TABLE.get_or_init(|| Self::build(TAPS, CUTOFF)).clone();
+        Self { table, taps: TAPS }
+    }
+
+    /// For converting `from_rate` to `to_rate` (offline clip conversion). Downsampling lowers
+    /// the cutoff to below the *output* Nyquist and widens the kernel to keep the transition
+    /// band as sharp, so nothing aliases.
+    pub fn conversion(from_rate: u32, to_rate: u32) -> Self {
+        let ratio = to_rate as f64 / from_rate as f64;
+        let cutoff = CUTOFF * ratio.min(1.0);
+        let taps = ((2 * TAPS) as f64 / ratio.min(1.0)).ceil() as usize;
+        let taps = taps.next_multiple_of(2).min(1024);
+        Self {
+            table: Self::build(taps, cutoff),
+            taps,
+        }
+    }
+
+    fn build(taps: usize, cutoff: f64) -> Arc<[f32]> {
+        let bessel_i0 = |x: f64| {
+            // Power series; converges fast for the arguments used here.
+            let (mut sum, mut term) = (1.0, 1.0);
+            for k in 1..50 {
+                term *= (x / 2.0) * (x / 2.0) / (k * k) as f64;
+                sum += term;
             }
-            t.into()
-        })
-        .clone()
+            sum
+        };
+        let half = taps / 2;
+        let norm = bessel_i0(KAISER_BETA);
+        let mut t = Vec::with_capacity((PHASES + 1) * taps);
+        for p in 0..=PHASES {
+            let phase = p as f64 / PHASES as f64;
+            let row: Vec<f64> = (0..taps)
+                .map(|i| {
+                    let x = i as f64 - (half - 1) as f64 - phase; // distance from the output point
+                    let arg = 2.0 * cutoff * x;
+                    let sinc = if arg.abs() < 1e-12 {
+                        1.0
+                    } else {
+                        (std::f64::consts::PI * arg).sin() / (std::f64::consts::PI * arg)
+                    };
+                    let w = (x / half as f64).clamp(-1.0, 1.0);
+                    sinc * bessel_i0(KAISER_BETA * (1.0 - w * w).sqrt()) / norm
+                })
+                .collect();
+            let sum: f64 = row.iter().sum();
+            t.extend(row.iter().map(|c| (c / sum) as f32));
+        }
+        t.into()
+    }
 }
 
 /// Streaming fractional-delay resampler, stereo planar. Allocation-free after `new`.
 pub struct Resampler {
-    kernel: Arc<[f32]>,
+    kernel: Kernel,
+    half: usize,
     buf: [Vec<f32>; 2],
     /// Position of the next output, in input frames, as an index into `buf`.
     pos: f64,
 }
 
 impl Resampler {
-    /// `max_in`: the most input frames ever pushed at once.
+    /// A drift resampler. `max_in`: the most input frames ever pushed at once.
     pub fn new(max_in: usize) -> Self {
-        let cap = TAPS + max_in + 8;
+        Self::with_kernel(Kernel::drift(), max_in)
+    }
+
+    pub fn with_kernel(kernel: Kernel, max_in: usize) -> Self {
+        let half = kernel.taps / 2;
+        let cap = kernel.taps + max_in + 8;
         let history = || {
             let mut v = Vec::with_capacity(cap);
-            v.resize(HALF - 1, 0.0);
+            v.resize(half - 1, 0.0);
             v
         };
         Self {
-            kernel: kernel(),
+            half,
+            kernel,
             buf: [history(), history()],
-            pos: (HALF - 1) as f64,
+            pos: (half - 1) as f64,
         }
     }
 
     fn len(&self) -> usize {
         self.buf[0].len()
+    }
+
+    /// Frames of lookahead the filter needs past an output before it can produce it.
+    pub fn lookahead(&self) -> usize {
+        self.half
     }
 
     /// Input frames to push before `n_out` outputs can be produced at `step`.
@@ -119,12 +156,17 @@ impl Resampler {
             return 0;
         }
         let last = self.pos + (n_out - 1) as f64 * step;
-        (last.floor() as usize + HALF + 1).saturating_sub(self.len())
+        (last.floor() as usize + self.half + 1).saturating_sub(self.len())
+    }
+
+    /// Room for this many more input frames before `produce` must run.
+    pub fn room(&self) -> usize {
+        self.buf[0].capacity() - self.len()
     }
 
     /// Append input. Anything beyond the preallocated capacity is dropped (never reallocates).
     pub fn push_frames(&mut self, frames: &[Frame]) {
-        let room = self.buf[0].capacity() - self.len();
+        let room = self.room();
         for f in &frames[..frames.len().min(room)] {
             self.buf[0].push(f[0]);
             self.buf[1].push(f[1]);
@@ -132,7 +174,7 @@ impl Resampler {
     }
 
     pub fn push_planar(&mut self, l: &[f32], r: &[f32]) {
-        let n = l.len().min(r.len()).min(self.buf[0].capacity() - self.len());
+        let n = l.len().min(r.len()).min(self.room());
         self.buf[0].extend_from_slice(&l[..n]);
         self.buf[1].extend_from_slice(&r[..n]);
     }
@@ -140,20 +182,21 @@ impl Resampler {
     /// Produce up to `max` outputs, as far as the buffered input allows. Calls `emit(i, l, r)`
     /// for each; returns how many.
     pub fn produce(&mut self, max: usize, step: f64, mut emit: impl FnMut(usize, f32, f32)) -> usize {
+        let (taps, half) = (self.kernel.taps, self.half);
         let mut n = 0;
-        while n < max && self.pos.floor() as usize + HALF < self.len() {
+        while n < max && self.pos.floor() as usize + half < self.len() {
             let c0 = self.pos.floor() as usize;
             let phase = (self.pos - c0 as f64) * PHASES as f64;
             let p0 = (phase as usize).min(PHASES - 1);
             let t = (phase - p0 as f64) as f32;
             let (row0, row1) = (
-                &self.kernel[p0 * TAPS..][..TAPS],
-                &self.kernel[(p0 + 1) * TAPS..][..TAPS],
+                &self.kernel.table[p0 * taps..][..taps],
+                &self.kernel.table[(p0 + 1) * taps..][..taps],
             );
-            let start = c0 + 1 - HALF;
-            let (l, r) = (&self.buf[0][start..start + TAPS], &self.buf[1][start..start + TAPS]);
+            let start = c0 + 1 - half;
+            let (l, r) = (&self.buf[0][start..start + taps], &self.buf[1][start..start + taps]);
             let (mut al, mut ar) = (0.0f32, 0.0f32);
-            for i in 0..TAPS {
+            for i in 0..taps {
                 let k = row0[i] + t * (row1[i] - row0[i]);
                 al += k * l[i];
                 ar += k * r[i];
@@ -163,7 +206,7 @@ impl Resampler {
             n += 1;
         }
         // Drop input no future output needs.
-        let drop = (self.pos.floor() as usize + 1).saturating_sub(HALF).min(self.len());
+        let drop = (self.pos.floor() as usize + 1).saturating_sub(half).min(self.len());
         if drop > 0 {
             for ch in &mut self.buf {
                 ch.copy_within(drop.., 0);

@@ -71,6 +71,8 @@ pub struct StreamInfo {
 pub struct Stream {
     pub info: StreamInfo,
     pub stats: Arc<StreamStats>,
+    /// Capture (device → ring) rather than render.
+    pub capture: bool,
     thread: RtThread,
 }
 
@@ -278,6 +280,11 @@ pub struct WasapiEndpoints {
     next_key: EndpointKey,
     /// Open device threads: (key, node, stream).
     pub streams: Vec<(EndpointKey, NodeId, Stream)>,
+    /// Streams already reported lost.
+    lost: Vec<EndpointKey>,
+    /// The driver's virtual endpoints, if a link was given.
+    #[cfg(feature = "driver")]
+    pub virtual_eps: Option<crate::backend::driver::VirtualEndpoints<Box<dyn crate::backend::driver::DriverLink>>>,
 }
 
 impl WasapiEndpoints {
@@ -288,7 +295,19 @@ impl WasapiEndpoints {
             mix_burst: block,
             next_key: 0,
             streams: Vec::new(),
+            lost: Vec::new(),
+            #[cfg(feature = "driver")]
+            virtual_eps: None,
         }
+    }
+
+    /// Also serve the driver's virtual endpoints through `link`.
+    #[cfg(feature = "driver")]
+    pub fn with_driver(mut self, link: Box<dyn crate::backend::driver::DriverLink>) -> Self {
+        let mut v = crate::backend::driver::VirtualEndpoints::new(link, self.block);
+        v.set_mix_burst(self.mix_burst);
+        self.virtual_eps = Some(v);
+        self
     }
 
     fn add(&mut self, node: NodeId, stream: Stream) -> EndpointKey {
@@ -317,7 +336,59 @@ impl Endpoints for WasapiEndpoints {
         open().map_err(|e| e.message())
     }
 
+    #[cfg(feature = "driver")]
+    fn virtual_input(&mut self, node: NodeId, endpoint: u32) -> std::result::Result<(RingReader, EndpointKey), String> {
+        match &mut self.virtual_eps {
+            Some(v) => v.open_source(node, endpoint),
+            None => Err("no driver link: start the engine with one".into()),
+        }
+    }
+
+    #[cfg(feature = "driver")]
+    fn virtual_output(
+        &mut self,
+        node: NodeId,
+        endpoint: u32,
+    ) -> std::result::Result<(RingWriter, EndpointKey), String> {
+        match &mut self.virtual_eps {
+            Some(v) => v.open_mic(node, endpoint),
+            None => Err("no driver link: start the engine with one".into()),
+        }
+    }
+
+    fn take_lost(&mut self) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        for (key, node, stream) in &self.streams {
+            if stream.is_finished() && !self.lost.contains(key) {
+                self.lost.push(*key);
+                out.push(*node);
+            }
+        }
+        out
+    }
+
+    fn device_stats(&self) -> Vec<(NodeId, bool, crate::rt::stats::StatsSnapshot)> {
+        #[allow(unused_mut)]
+        let mut out: Vec<_> = self
+            .streams
+            .iter()
+            .map(|(_, node, s)| (*node, s.capture, s.stats.snapshot()))
+            .collect();
+        #[cfg(feature = "driver")]
+        if let Some(v) = &self.virtual_eps {
+            out.extend(v.device_stats());
+        }
+        out
+    }
+
     fn release(&mut self, key: EndpointKey) {
+        self.lost.retain(|k| *k != key);
+        #[cfg(feature = "driver")]
+        if let Some(v) = &mut self.virtual_eps
+            && v.release(key)
+        {
+            return;
+        }
         // Dropping the stream stops its thread.
         self.streams.retain(|(k, ..)| *k != key);
     }
@@ -327,6 +398,10 @@ impl Endpoints for WasapiEndpoints {
         self.mix_burst = device
             .and_then(|id| default_period_frames(id).ok())
             .map_or(self.block, |period| period.div_ceil(self.block) * self.block);
+        #[cfg(feature = "driver")]
+        if let Some(v) = &mut self.virtual_eps {
+            v.set_mix_burst(self.mix_burst);
+        }
     }
 }
 
@@ -361,7 +436,12 @@ fn spawn_stream(
         },
         move |(_mmcss, client, stats), stop| run(&client, &stats, stop),
     )?;
-    Ok(Stream { info, stats, thread })
+    Ok(Stream {
+        info,
+        stats,
+        capture: name == "sb-capture",
+        thread,
+    })
 }
 
 /// MMCSS "Pro Audio" registration for the current thread, reverted on drop. `ok` records

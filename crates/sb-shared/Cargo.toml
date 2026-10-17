@@ -1,9 +1,11 @@
 [package]
 name = "sb-shared"
 version = "0.1.0"
-description = "Types shared between the soundboard engine and controller: GraphSpec, ids, errors"
+description = "Types shared between the soundboard engine, host and controller: GraphSpec, ids, errors, events, the engine pipe protocol"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+postcard.workspace = true
+serde.workspace = true

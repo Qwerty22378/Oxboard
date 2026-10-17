@@ -10,8 +10,11 @@
 //! values, so it never allocates.
 
 use crate::Frame;
+use crate::clips::ClipData;
+use crate::clips::stream::StreamEnds;
 use crate::clock::drift::Drift;
-use crate::graph::spec::{MeterId, ParamId};
+use crate::graph::spec::{MeterId, NodeId, ParamId};
+use crate::nodes::clip::{ClipSettings, ClipState};
 use crate::rt::meters::{MeterTable, RmsState};
 use crate::rt::params::{EDGE_FADE_FRAMES, ParamTable, Smoother};
 use crate::rt::ring::{RingReader, RingWriter};
@@ -42,6 +45,10 @@ pub struct SmootherId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FadeId(pub usize);
 
+/// A clip node's slot (its decoded data, settings and voices).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipSlotId(pub usize);
+
 /// A meter op's RMS state slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RmsId(pub usize);
@@ -60,6 +67,8 @@ pub enum Gain {
 pub enum Op {
     /// Input ring → `dst`. Silence (and an xrun count) if the ring runs dry.
     Pull { ring: InRing, dst: BufId },
+    /// A clip's voices → `dst`.
+    Clip { slot: ClipSlotId, dst: BufId },
     /// Sine test tone → `dst` (same signal on both channels).
     Sine {
         osc: OscId,
@@ -93,6 +102,18 @@ pub enum Move {
     Smoother(usize, usize),
     Fade(usize, usize),
     Rms(usize, usize),
+    /// A clip's voices and streamer ends (its decoded data stays the new plan's own).
+    Clip(usize, usize),
+}
+
+/// One clip node in the plan.
+pub struct ClipSlot {
+    pub node: NodeId,
+    pub data: Arc<ClipData>,
+    pub settings: ClipSettings,
+    pub state: ClipState,
+    /// The streamer's ends, for a long clip; `None` until handed over if inherited.
+    pub stream: Option<StreamEnds>,
 }
 
 /// One input ring as the plan sees it.
@@ -134,6 +155,7 @@ pub struct RenderPlan {
     pub(crate) fade_targets: Vec<f32>,
     pub(crate) meters: Arc<MeterTable>,
     pub(crate) rms: Vec<RmsState>,
+    pub(crate) clips: Vec<ClipSlot>,
     pub(crate) handoff: Vec<Move>,
     /// Adopt only once the running plan's fades have finished (a "settle" plan that drops
     /// faded-out edges and nodes).
@@ -165,6 +187,15 @@ impl RenderPlan {
         self.wait_for_fades
     }
 
+    /// The clip slot of `node`, if this plan has one.
+    pub fn clip_mut(&mut self, node: NodeId) -> Option<&mut ClipSlot> {
+        self.clips.iter_mut().find(|c| c.node == node)
+    }
+
+    pub fn clips_mut(&mut self) -> impl Iterator<Item = &mut ClipSlot> {
+        self.clips.iter_mut()
+    }
+
     /// Move inherited state out of `old` (the running plan) into this one. Real-time safe:
     /// only swaps, and skips a move whose slots don't exist rather than panicking.
     pub fn adopt_from(&mut self, old: &mut RenderPlan) {
@@ -181,6 +212,12 @@ impl RenderPlan {
                 Move::Smoother(f, t) => swap(&mut self.smoothers, &mut old.smoothers, f, t),
                 Move::Fade(f, t) => swap(&mut self.fades, &mut old.fades, f, t),
                 Move::Rms(f, t) => swap(&mut self.rms, &mut old.rms, f, t),
+                Move::Clip(f, t) => {
+                    if let (Some(a), Some(b)) = (self.clips.get_mut(t), old.clips.get_mut(f)) {
+                        std::mem::swap(&mut a.state, &mut b.state);
+                        std::mem::swap(&mut a.stream, &mut b.stream);
+                    }
+                }
             }
         }
     }
@@ -223,6 +260,7 @@ impl PlanBuilder {
                 fade_targets: Vec::new(),
                 meters,
                 rms: Vec::new(),
+                clips: Vec::new(),
                 handoff: Vec::new(),
                 wait_for_fades: false,
                 master_device: None,
@@ -335,6 +373,30 @@ impl PlanBuilder {
         self.op(Op::Meter { src, meter, state })
     }
 
+    /// A clip node: its data, settings and (long clips) streamer ends; or, with
+    /// `inherit_from`, voices and streamer taken over from that slot of the running plan.
+    pub fn clip(
+        &mut self,
+        node: NodeId,
+        data: Arc<ClipData>,
+        settings: ClipSettings,
+        stream: Option<StreamEnds>,
+        inherit_from: Option<usize>,
+    ) -> ClipSlotId {
+        self.plan.clips.push(ClipSlot {
+            node,
+            data,
+            settings,
+            state: ClipState::default(),
+            stream,
+        });
+        let id = self.plan.clips.len() - 1;
+        if let Some(from) = inherit_from {
+            self.plan.handoff.push(Move::Clip(from, id));
+        }
+        ClipSlotId(id)
+    }
+
     pub fn wait_for_fades(&mut self, wait: bool) -> &mut Self {
         self.plan.wait_for_fades = wait;
         self
@@ -360,6 +422,10 @@ impl PlanBuilder {
                 buf(dst);
             }
             Op::Clear { dst } => buf(dst),
+            Op::Clip { slot, dst } => {
+                assert!(slot.0 < p.clips.len(), "{op:?}: unknown clip slot");
+                buf(dst);
+            }
             Op::MixAdd { src, dst, gain, fade } => {
                 buf(src);
                 buf(dst);

@@ -1,4 +1,7 @@
-//! Device I/O. WASAPI only; the driver's shared-ring backend arrives in E7 behind the
-//! `driver` feature.
+//! Device I/O: WASAPI devices (Windows), and the driver's virtual endpoints over shared rings
+//! (`driver` feature; platform-independent apart from the real driver link).
 
+#[cfg(feature = "driver")]
+pub mod driver;
+#[cfg(windows)]
 pub mod wasapi;

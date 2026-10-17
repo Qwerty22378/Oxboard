@@ -6,9 +6,15 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Virtual endpoints through the soundboard driver's shared rings (E7).
+driver = ["dep:sb-ring"]
+
 [dependencies]
 rtrb.workspace = true
+sb-ring = { workspace = true, optional = true }
 sb-shared.workspace = true
+symphonia.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true
@@ -25,3 +31,7 @@ features = [
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
 ]
+
+[[example]]
+name = "virtual"
+required-features = ["driver"]

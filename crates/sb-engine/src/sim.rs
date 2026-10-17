@@ -1,4 +1,5 @@
-//! Simulated devices with their own clocks, driving the real engine (E6 tests).
+//! Simulated devices with their own clocks, driving the real engine (E6 tests; with the
+//! `driver` feature also the driver's virtual endpoints, E7).
 //!
 //! Each device ticks at `48 kHz × (1 + ppm)` in bursts of its period, on its own timeline,
 //! and stamps its ring a little late (thread wake-up jitter). The master device's ticks wake
@@ -27,13 +28,28 @@ enum DeviceEnd {
     Capture { writer: RingWriter, phase: f64 },
     /// Render device: reads from the ring the mix writes; keeps what it played.
     Render { reader: RingReader, played: Vec<f32> },
+    /// Driver render endpoint ("v<id>"): the fake driver's tick produces what apps play into
+    /// the shared ring, then the engine's pump moves it into the engine ring.
+    #[cfg(feature = "driver")]
+    VirtualSource {
+        ticker: crate::backend::driver::FakeTicker,
+        pump: crate::backend::driver::SourcePump,
+    },
+    /// Driver virtual mic: the tick consumes a period (what apps capture), then the pump
+    /// tops the shared ring up from the engine ring.
+    #[cfg(feature = "driver")]
+    VirtualMic {
+        ticker: crate::backend::driver::FakeTicker,
+        pump: crate::backend::driver::MicPump,
+        played: Vec<f32>,
+    },
 }
 
 struct SimDevice {
     spec: DeviceSpec,
     end: DeviceEnd,
     next_ns: f64,
-    stats: StreamStats,
+    stats: std::sync::Arc<StreamStats>,
 }
 
 struct SimEndpoints {
@@ -75,6 +91,65 @@ impl Endpoints for SimEndpoints {
             stats: Default::default(),
         };
         self.open.push((self.next_key, device.into(), dev));
+        Ok((writer, self.next_key))
+    }
+
+    #[cfg(feature = "driver")]
+    fn virtual_input(&mut self, _: NodeId, endpoint: u32) -> Result<(RingReader, EndpointKey), String> {
+        use crate::backend::driver::{FakeEndpoint, FakeTicker, SHARED_RING_FRAMES, SharedRing, SourcePump};
+        let spec = self.devices[&format!("v{endpoint}")];
+        let ring = std::sync::Arc::new(SharedRing::new(SHARED_RING_FRAMES)?);
+        let cfg = FakeEndpoint {
+            id: endpoint,
+            direction: sb_ring::ioctl::Direction::FromApps,
+            period_frames: spec.period,
+            ppm: spec.ppm,
+            tone_hz: self.tone_hz,
+        };
+        let ticker = FakeTicker::new(cfg, ring.clone(), Default::default())?;
+        let (writer, reader) = RingSizing::for_bursts(spec.period, self.mix_burst).ring();
+        let stats = std::sync::Arc::new(StreamStats::default());
+        let pump = SourcePump::new(&ring, writer, stats.clone());
+        self.next_key += 1;
+        let dev = SimDevice {
+            spec,
+            end: DeviceEnd::VirtualSource { ticker, pump },
+            next_ns: 0.0,
+            stats,
+        };
+        self.open.push((self.next_key, format!("v{endpoint}"), dev));
+        Ok((reader, self.next_key))
+    }
+
+    #[cfg(feature = "driver")]
+    fn virtual_output(&mut self, _: NodeId, endpoint: u32) -> Result<(RingWriter, EndpointKey), String> {
+        use crate::backend::driver::{FakeEndpoint, FakeTicker, MicPump, SHARED_RING_FRAMES, SharedRing};
+        let spec = self.devices[&format!("v{endpoint}")];
+        let ring = std::sync::Arc::new(SharedRing::new(SHARED_RING_FRAMES)?);
+        let cfg = FakeEndpoint {
+            id: endpoint,
+            direction: sb_ring::ioctl::Direction::ToApps,
+            period_frames: spec.period,
+            ppm: spec.ppm,
+            tone_hz: 0.0,
+        };
+        let ticker = FakeTicker::new(cfg, ring.clone(), Default::default())?;
+        let (writer, reader) = RingSizing::for_bursts(self.mix_burst, spec.period).ring();
+        let stats = std::sync::Arc::new(StreamStats::default());
+        let pump = MicPump::new(&ring, reader, stats.clone(), spec.period);
+        self.next_key += 1;
+        let end = DeviceEnd::VirtualMic {
+            ticker,
+            pump,
+            played: Vec::new(),
+        };
+        let dev = SimDevice {
+            spec,
+            end,
+            next_ns: 0.0,
+            stats,
+        };
+        self.open.push((self.next_key, format!("v{endpoint}"), dev));
         Ok((writer, self.next_key))
     }
 
@@ -216,6 +291,17 @@ impl Sim {
                     reader.read(&mut buf, &d.stats);
                     reader.stamp((at + jitter) as u64);
                     played.extend(buf.iter().map(|f| f[0]));
+                }
+                #[cfg(feature = "driver")]
+                DeviceEnd::VirtualSource { ticker, pump } => {
+                    ticker.tick();
+                    pump.step((at + jitter) as u64);
+                }
+                #[cfg(feature = "driver")]
+                DeviceEnd::VirtualMic { ticker, pump, played } => {
+                    ticker.tick();
+                    played.extend(ticker.last_period().iter().map(|f| f[0]));
+                    pump.step((at + jitter) as u64);
                 }
             }
             d.next_ns += n as f64 / (48_000.0 * (1.0 + d.spec.ppm * 1e-6)) * 1e9;
@@ -400,4 +486,82 @@ fn stalls_that_lose_audio_dont_throw_the_drift_controllers() {
         trims <= 6 * 2 * 3000,
         "trimmed {trims} frames: more than once per output per stall"
     );
+}
+
+/// E7: an app plays into a driver render endpoint whose timer runs +300 ppm fast; the engine
+/// routes it to the master speakers and to a virtual mic whose timer runs 250 ppm slow. Both
+/// shared-ring paths go through the real `sb-ring` handles, pumps and fake-driver ticks.
+#[cfg(feature = "driver")]
+#[test]
+fn virtual_endpoints_drift_correct_and_run_clean() {
+    use crate::graph::spec::{NodeKind, NodeSpec};
+    let devices = [("spk", 480, 0.0), ("v1", 480, 300.0), ("v2", 480, -250.0)];
+    let mut sim = Sim::new(256, &devices, "spk", 1000.0);
+    let spec = GraphSpec {
+        nodes: vec![
+            NodeSpec {
+                id: NodeId(1),
+                kind: NodeKind::VirtualSource { endpoint: 1 },
+            },
+            crate::testing::bus(2),
+            output(3, "spk"),
+            NodeSpec {
+                id: NodeId(4),
+                kind: NodeKind::VirtualMic { endpoint: 2 },
+            },
+        ],
+        edges: vec![edge(1, 2), edge(2, 3), edge(2, 4)],
+        master: Some(NodeId(3)),
+        ..Default::default()
+    };
+    sim.engine.apply_graph(&spec).unwrap();
+    sim.run(120.0);
+
+    let before: Vec<_> = [1, 4].iter().map(|&n| sim.ring_stats(n)).collect();
+    let mic_played_from = match &sim.device("v2").end {
+        DeviceEnd::VirtualMic { played, .. } => played.len(),
+        _ => unreachable!(),
+    };
+    let mic_underruns = |sim: &Sim| match &sim.device("v2").end {
+        DeviceEnd::VirtualMic { ticker, .. } => ticker.stats.underruns.load(std::sync::atomic::Ordering::Relaxed),
+        _ => unreachable!(),
+    };
+    let underruns_before = mic_underruns(&sim);
+    let master_from = sim.clock.out.len();
+    sim.run(60.0);
+
+    for ((node, want), b) in [(1, 300.0), (4, 250.0)].iter().zip(&before) {
+        let s = sim.ring_stats(*node);
+        assert_eq!(s.xruns, b.xruns, "node {node}: xruns while converged");
+        assert_eq!(s.trimmed_frames, b.trimmed_frames, "node {node}: trims while converged");
+        assert!(
+            (s.drift_ppm as f64 - want).abs() < 40.0,
+            "node {node}: ppm {} vs {want}",
+            s.drift_ppm
+        );
+    }
+    assert_eq!(
+        mic_underruns(&sim),
+        underruns_before,
+        "the virtual mic ran dry while converged"
+    );
+    let freq = 1000.0 * 1.0003; // the app's tone, played on a clock 300 ppm fast
+    let m: Vec<f32> = sim.clock.out[master_from..].iter().map(|f| f[0]).collect();
+    assert!(
+        glitch_ratio(&m, freq, 0.5) < 1.05,
+        "master glitch {}",
+        glitch_ratio(&m, freq, 0.5)
+    );
+    assert!(
+        m.iter().fold(0.0f32, |a, b| a.max(b.abs())) > 0.49,
+        "the app's audio reached the speakers"
+    );
+    if let DeviceEnd::VirtualMic { played, .. } = &sim.device("v2").end {
+        let r = glitch_ratio(&played[mic_played_from..], freq, 0.5);
+        assert!(r < 1.05, "virtual mic glitch ratio {r}");
+        assert!(
+            played[mic_played_from..].iter().fold(0.0f32, |a, b| a.max(b.abs())) > 0.49,
+            "apps hear it"
+        );
+    }
 }

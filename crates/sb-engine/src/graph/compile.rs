@@ -18,8 +18,10 @@
 //! Declared param values are written to the param table before emitting, so new smoothers
 //! start settled at them. After that the controller moves params with `ParamTable::set`.
 
+use crate::clips::{CLIP_KEY_BIT, ClipStore};
 use crate::graph::plan::{self, BufId, Op, PlanBuilder, RenderPlan};
-use crate::graph::spec::{EdgeSpec, GraphError, GraphSpec, MeterId, NodeId, NodeKind, NodeSpec, ParamId};
+use crate::graph::spec::{EdgeSpec, GraphError, GraphSpec, IdKind, MeterId, NodeId, NodeKind, NodeSpec, ParamId};
+use crate::nodes::clip::ClipSettings;
 use crate::rt::meters::MeterTable;
 use crate::rt::params::ParamTable;
 use crate::rt::ring::{RingReader, RingWriter};
@@ -39,27 +41,59 @@ pub trait Endpoints {
     fn input(&mut self, node: NodeId, device: &str) -> Result<(RingReader, EndpointKey), String>;
     /// Ring drained by the render device `device`, for output node `node` (not the master).
     fn output(&mut self, node: NodeId, device: &str) -> Result<(RingWriter, EndpointKey), String>;
+    /// Ring fed by the driver's virtual render endpoint `endpoint` (what apps play into it).
+    fn virtual_input(&mut self, _node: NodeId, _endpoint: u32) -> Result<(RingReader, EndpointKey), String> {
+        Err("virtual endpoints need the engine's `driver` feature".into())
+    }
+    /// Ring feeding the driver's virtual microphone `endpoint`.
+    fn virtual_output(&mut self, _node: NodeId, _endpoint: u32) -> Result<(RingWriter, EndpointKey), String> {
+        Err("virtual endpoints need the engine's `driver` feature".into())
+    }
     /// No plan uses this endpoint any more: close it.
     fn release(&mut self, key: EndpointKey);
     /// The master device is about to change (it sets how bursty the mix is, which sizes
     /// new rings).
     fn master_changed(&mut self, _device: Option<&str>) {}
+    /// Nodes whose stream died since the last call (unplugged, disabled, invalidated). Each
+    /// is reported once; the engine forwards them as `DeviceLost`.
+    fn take_lost(&mut self) -> Vec<NodeId> {
+        Vec::new()
+    }
+    /// Device-side counters of every open stream: (node, captures?, stats).
+    fn device_stats(&self) -> Vec<(NodeId, bool, crate::rt::stats::StatsSnapshot)> {
+        Vec::new()
+    }
 }
 
-/// The param and meter tables a plan reads and writes, shared with the controller side.
-/// Fixed size: ids index them directly.
+/// What plans share with the controller side: the param and meter tables (fixed size; ids
+/// index them directly) and the clip store (decoded clips, long-clip streamers).
 #[derive(Clone)]
 pub struct Tables {
     pub params: Arc<ParamTable>,
     pub meters: Arc<MeterTable>,
+    pub clips: Arc<ClipStore>,
 }
 
 impl Tables {
     pub fn new(params: usize, meters: usize) -> Self {
+        Self::with_clips(params, meters, ClipStore::default())
+    }
+
+    pub fn with_clips(params: usize, meters: usize, clips: ClipStore) -> Self {
         Self {
             params: Arc::new(ParamTable::new(params)),
             meters: Arc::new(MeterTable::new(meters)),
+            clips: Arc::new(clips),
         }
+    }
+}
+
+/// Same node for inheritance purposes. A clip is the same clip as long as its file is: its
+/// settings (polyphony, retrigger, loop) can change while it plays.
+fn same_identity(a: &NodeKind, b: &NodeKind) -> bool {
+    match (a, b) {
+        (NodeKind::Clip { path: pa, .. }, NodeKind::Clip { path: pb, .. }) => pa == pb,
+        _ => a == b,
     }
 }
 
@@ -106,6 +140,8 @@ pub struct Layout {
     smoothers: Vec<EdgeKey>,
     fades: Vec<EdgeKey>,
     rms: Vec<(MeterId, NodeId)>,
+    /// Clip slots: node and (long clips) its streamer's key.
+    clips: Vec<(NodeId, Option<EndpointKey>)>,
 }
 
 impl Layout {
@@ -147,11 +183,16 @@ impl Layout {
     }
 
     pub fn uses_endpoint(&self, key: EndpointKey) -> bool {
-        self.inputs.iter().chain(&self.outputs).any(|e| e.key == key)
+        self.endpoint_keys().any(|k| k == key)
     }
 
+    /// Device and virtual endpoints, and clip streamers (`CLIP_KEY_BIT` set).
     pub fn endpoint_keys(&self) -> impl Iterator<Item = EndpointKey> + '_ {
-        self.inputs.iter().chain(&self.outputs).map(|e| e.key)
+        self.inputs
+            .iter()
+            .chain(&self.outputs)
+            .map(|e| e.key)
+            .chain(self.clips.iter().filter_map(|c| c.1))
     }
 }
 
@@ -217,7 +258,7 @@ pub fn compile_against(
     );
     if result.is_err() {
         for key in opened {
-            endpoints.release(key);
+            release(key, tables, endpoints);
         }
     }
     result
@@ -271,6 +312,15 @@ fn validate(spec: &GraphSpec, tables: &Tables) -> Result<Graph, GraphError> {
         if index.insert(n.id, i).is_some() {
             return Err(GraphError::DuplicateNode(n.id));
         }
+        if let NodeKind::Clip { polyphony, .. } = n.kind
+            && !(1..=crate::nodes::clip::MAX_POLYPHONY).contains(&polyphony)
+        {
+            return Err(GraphError::InvalidValue(format!(
+                "clip node {}: polyphony {polyphony} must be 1..={}",
+                n.id.0,
+                crate::nodes::clip::MAX_POLYPHONY
+            )));
+        }
         if let NodeKind::Tone { freq, gain } = n.kind {
             let nyquist = crate::SAMPLE_RATE as f32 / 2.0;
             if !(freq.is_finite() && (0.0..nyquist).contains(&freq) && gain.is_finite()) {
@@ -287,7 +337,7 @@ fn validate(spec: &GraphSpec, tables: &Tables) -> Result<Graph, GraphError> {
         if !params.insert(p.id) {
             return Err(GraphError::DuplicateParam(p.id));
         }
-        in_range("param", p.id.0, tables.params.capacity())?;
+        in_range(IdKind::Param, p.id.0, tables.params.capacity())?;
         if !p.value.is_finite() {
             return Err(GraphError::InvalidValue(format!("param {} = {}", p.id.0, p.value)));
         }
@@ -341,7 +391,7 @@ fn validate(spec: &GraphSpec, tables: &Tables) -> Result<Graph, GraphError> {
         if !meter_ids.insert(m.id) {
             return Err(GraphError::DuplicateMeter(m.id));
         }
-        in_range("meter", m.id.0, tables.meters.capacity())?;
+        in_range(IdKind::Meter, m.id.0, tables.meters.capacity())?;
         let i = *index.get(&m.node).ok_or(GraphError::UnknownMeterNode {
             meter: m.id,
             node: m.node,
@@ -363,7 +413,11 @@ fn transition(g: &mut Graph, prev: &Layout, ghosts: bool) {
     let prev_edges: HashMap<EdgeKey, EdgeStatus> =
         prev.edges.iter().map(|(e, s)| ((e.from, e.to, e.gain), *s)).collect();
     let mut index: HashMap<NodeId, usize> = g.nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
-    let unchanged = |g: &Graph, i: usize| prev_kind.get(&g.nodes[i].id) == Some(&&g.nodes[i].kind);
+    let unchanged = |g: &Graph, i: usize| {
+        prev_kind
+            .get(&g.nodes[i].id)
+            .is_some_and(|k| same_identity(k, &g.nodes[i].kind))
+    };
 
     for t in 0..g.nodes.len() {
         for k in 0..g.inputs[t].len() {
@@ -507,6 +561,7 @@ struct Inherit<'a> {
     smoothers: HashMap<EdgeKey, usize>,
     fades: HashMap<EdgeKey, usize>,
     rms: HashMap<(MeterId, NodeId), usize>,
+    clips: HashMap<NodeId, (usize, Option<EndpointKey>)>,
 }
 
 impl<'a> Inherit<'a> {
@@ -520,12 +575,13 @@ impl<'a> Inherit<'a> {
             smoothers: prev.smoothers.iter().enumerate().map(|(i, k)| (*k, i)).collect(),
             fades: prev.fades.iter().enumerate().map(|(i, k)| (*k, i)).collect(),
             rms: prev.rms.iter().enumerate().map(|(i, k)| (*k, i)).collect(),
+            clips: prev.clips.iter().enumerate().map(|(i, (n, k))| (*n, (i, *k))).collect(),
         }
     }
 
     /// Same node, same kind: its state carries over.
     fn unchanged(&self, node: &NodeSpec) -> bool {
-        self.kind.get(&node.id) == Some(&&node.kind)
+        self.kind.get(&node.id).is_some_and(|k| same_identity(k, &node.kind))
     }
 }
 
@@ -560,14 +616,19 @@ fn emit(
             g.outputs[i].iter().filter(|&&t| live[t]).count() + g.meters[i].len() + node.kind.is_sink() as usize;
 
         let buf = match &node.kind {
-            NodeKind::DeviceInput { device } => {
+            NodeKind::DeviceInput { .. } | NodeKind::VirtualSource { .. } => {
                 let ring = match prev.inputs.get(&node.id).filter(|_| same) {
                     Some(&(slot, ep)) => {
                         layout.inputs.push(ep.clone());
                         b.inherit_input(slot)
                     }
                     None => {
-                        let (reader, key) = endpoints.input(node.id, device).map_err(endpoint_err)?;
+                        let opened_ring = match &node.kind {
+                            NodeKind::DeviceInput { device } => endpoints.input(node.id, device),
+                            NodeKind::VirtualSource { endpoint } => endpoints.virtual_input(node.id, *endpoint),
+                            _ => unreachable!("matched above"),
+                        };
+                        let (reader, key) = opened_ring.map_err(endpoint_err)?;
                         opened.push(key);
                         let (ring, stats) = b.input(reader);
                         layout.inputs.push(Endpoint {
@@ -580,6 +641,41 @@ fn emit(
                 };
                 let dst = bufs.alloc(&mut b);
                 b.op(Op::Pull { ring, dst });
+                dst
+            }
+            NodeKind::Clip {
+                path,
+                polyphony,
+                retrigger,
+                looped,
+            } => {
+                let clip_err = |reason| GraphError::Clip { node: node.id, reason };
+                let data = tables.clips.load(path).map_err(clip_err)?;
+                let settings = ClipSettings {
+                    polyphony: *polyphony,
+                    retrigger: *retrigger,
+                    looped: *looped,
+                };
+                let slot = match prev.clips.get(&node.id).filter(|_| same) {
+                    Some(&(slot, key)) => {
+                        layout.clips.push((node.id, key));
+                        b.clip(node.id, data, settings, None, Some(slot))
+                    }
+                    None => {
+                        let (stream, key) = match data.streamed {
+                            false => (None, None),
+                            true => {
+                                let (ends, key) = tables.clips.open_stream(path).map_err(clip_err)?;
+                                opened.push(key);
+                                (Some(ends), Some(key))
+                            }
+                        };
+                        layout.clips.push((node.id, key));
+                        b.clip(node.id, data, settings, stream, None)
+                    }
+                };
+                let dst = bufs.alloc(&mut b);
+                b.op(Op::Clip { slot, dst });
                 dst
             }
             NodeKind::Tone { freq, gain } => {
@@ -597,7 +693,8 @@ fn emit(
                 });
                 dst
             }
-            NodeKind::Bus | NodeKind::DeviceOutput { .. } => match g.inputs[i].as_slice() {
+            NodeKind::Bus | NodeKind::DeviceOutput { .. } | NodeKind::VirtualMic { .. } => match g.inputs[i].as_slice()
+            {
                 // Forward: same buffer, no ops. Its reads are added before ours is consumed,
                 // so it can't be freed in between.
                 &[
@@ -685,8 +782,10 @@ fn emit(
             bufs.read(buf);
         }
 
-        if let NodeKind::DeviceOutput { device } = &node.kind {
-            if g.master == Some(i) {
+        if node.kind.is_sink() {
+            if let (Some(m), NodeKind::DeviceOutput { device }) = (g.master, &node.kind)
+                && m == i
+            {
                 // `Master` only names the bus; the clock reads it after the whole block, so its
                 // read stays pending and the buffer is never handed to a later node.
                 b.op(Op::Master { src: buf });
@@ -698,7 +797,12 @@ fn emit(
                         b.inherit_output(slot)
                     }
                     None => {
-                        let (writer, key) = endpoints.output(node.id, device).map_err(endpoint_err)?;
+                        let opened_ring = match &node.kind {
+                            NodeKind::DeviceOutput { device } => endpoints.output(node.id, device),
+                            NodeKind::VirtualMic { endpoint } => endpoints.virtual_output(node.id, *endpoint),
+                            _ => unreachable!("only sinks get here"),
+                        };
+                        let (writer, key) = opened_ring.map_err(endpoint_err)?;
                         opened.push(key);
                         let (ring, stats) = b.output(writer);
                         layout.outputs.push(Endpoint {
@@ -723,6 +827,15 @@ fn emit(
         plan: b.build(),
         layout,
     })
+}
+
+/// Release an opened key to whoever owns it: the clip store or the device endpoints.
+pub(crate) fn release(key: EndpointKey, tables: &Tables, endpoints: &mut impl Endpoints) {
+    if key & CLIP_KEY_BIT != 0 {
+        tables.clips.release(key);
+    } else {
+        endpoints.release(key);
+    }
 }
 
 fn param_of(gain: Gain) -> Option<ParamId> {
@@ -1066,7 +1179,7 @@ mod tests {
                 ..base()
             }),
             GraphError::IdOutOfRange {
-                kind: "meter",
+                kind: IdKind::Meter,
                 id: 4,
                 capacity: 4
             }
@@ -1077,7 +1190,7 @@ mod tests {
                 ..base()
             }),
             GraphError::IdOutOfRange {
-                kind: "param",
+                kind: IdKind::Param,
                 id: 7,
                 capacity: 4
             }

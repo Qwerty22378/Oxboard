@@ -1,0 +1,24 @@
+[package]
+name = "sb-engine-host"
+version = "0.1.0"
+description = "The soundboard engine as its own process: sb-engine behind a named pipe (crash isolation)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sb-engine = { workspace = true, features = ["driver"] }
+sb-ring.workspace = true
+sb-shared.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",  # SDDL for the pipe's DACL
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",               # overlapped I/O
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+]

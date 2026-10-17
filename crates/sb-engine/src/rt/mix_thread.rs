@@ -10,8 +10,10 @@
 use crate::SAMPLE_RATE;
 use crate::clock::master::MasterClock;
 use crate::graph::plan::{Gain, Input, Op, Output, RenderPlan};
+use crate::graph::spec::{ClipAction, NodeId};
 use crate::rt::stats::MixStats;
 use rtrb::{Consumer, Producer, RingBuffer};
+use sb_shared::events::EngineEvent;
 use std::f64::consts::TAU;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Instant;
@@ -35,6 +37,7 @@ pub fn render_block(plan: &mut RenderPlan, now: u64) -> [&[f32]; 2] {
         fade_targets,
         meters,
         rms,
+        clips,
         ..
     } = plan;
     let mut master = None;
@@ -85,6 +88,11 @@ pub fn render_block(plan: &mut RenderPlan, now: u64) -> [&[f32]; 2] {
                 }
             }
             Op::Clear { dst } => bufs[dst.0].iter_mut().for_each(|ch| ch.fill(0.0)),
+            Op::Clip { slot, dst } => {
+                let c = &mut clips[slot.0];
+                let [l, r] = &mut bufs[dst.0];
+                c.state.render(&c.data, c.settings, c.stream.as_mut(), l, r);
+            }
             Op::MixAdd { src, dst, gain, fade } => {
                 let Ok([s, d]) = bufs.get_disjoint_mut([src.0, dst.0]) else {
                     continue;
@@ -189,19 +197,41 @@ fn mix_add(src: &[Vec<f32>; 2], dst: &mut [Vec<f32>; 2], g: f32) {
 /// Plans waiting in the queue at most. The control side gets `GraphError::Busy` beyond this.
 pub const PLAN_QUEUE_DEPTH: usize = 8;
 
-/// The control side's ends of the plan queues.
+/// Triggers queued at most (control → mix).
+pub const COMMAND_QUEUE_DEPTH: usize = 256;
+/// Events queued at most (mix → control); more are dropped and counted.
+pub const EVENT_QUEUE_DEPTH: usize = 1024;
+/// A trigger for a node the running plan doesn't have yet is retried this many blocks
+/// (~0.5 s), so "apply a graph, then play its clip" works without waiting.
+const PENDING_BLOCKS: u32 = 100;
+const PENDING_SLOTS: usize = 32;
+
+/// A one-shot action on a node (only clips so far).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Command {
+    pub node: NodeId,
+    pub action: ClipAction,
+}
+
+/// The control side's ends of the queues between it and the mix.
 pub struct PlanQueue {
     /// New plans, adopted in order, one per block at most.
     pub incoming: Producer<Box<RenderPlan>>,
     /// Plans the mix thread is done with; drop them here, off the audio thread.
     pub retired: Consumer<Box<RenderPlan>>,
+    pub commands: Producer<Command>,
+    pub events: Consumer<EngineEvent>,
 }
 
-/// The audio side: the running plan and its ends of the plan queues.
+/// The audio side: the running plan and its ends of the queues.
 pub struct MixCore {
     plan: Box<RenderPlan>,
     incoming: Consumer<Box<RenderPlan>>,
     retired: Producer<Box<RenderPlan>>,
+    commands: Consumer<Command>,
+    events: Producer<EngineEvent>,
+    /// Triggers waiting for their node's plan: (command, blocks left).
+    pending: [Option<(Command, u32)>; PENDING_SLOTS],
 }
 
 /// Connect a control side and a mix side, with `first` running.
@@ -209,15 +239,22 @@ pub fn plan_channel(first: RenderPlan) -> (PlanQueue, MixCore) {
     let (in_tx, in_rx) = RingBuffer::new(PLAN_QUEUE_DEPTH);
     // One more than can be in flight, so the mix thread always has room to retire a plan.
     let (out_tx, out_rx) = RingBuffer::new(PLAN_QUEUE_DEPTH + 1);
+    let (cmd_tx, cmd_rx) = RingBuffer::new(COMMAND_QUEUE_DEPTH);
+    let (ev_tx, ev_rx) = RingBuffer::new(EVENT_QUEUE_DEPTH);
     (
         PlanQueue {
             incoming: in_tx,
             retired: out_rx,
+            commands: cmd_tx,
+            events: ev_rx,
         },
         MixCore {
             plan: Box::new(first),
             incoming: in_rx,
             retired: out_tx,
+            commands: cmd_rx,
+            events: ev_tx,
+            pending: [None; PENDING_SLOTS],
         },
     )
 }
@@ -257,13 +294,47 @@ impl MixCore {
         true
     }
 
-    /// One block: adopt if due, render, deliver the master bus.
+    /// One block: adopt if due, apply triggers, render, deliver the master bus, report.
     pub fn block(&mut self, clock: &mut impl MasterClock, stats: &MixStats) {
         let start = Instant::now();
         self.adopt(clock, stats);
+        self.apply_commands();
         let [l, r] = render_block(&mut self.plan, clock.now_ns());
         clock.deliver(l, r);
+        for c in self.plan.clips_mut() {
+            if let Some(stopped) = c.state.take_ended() {
+                let _ = self.events.push(EngineEvent::ClipEnded { node: c.node, stopped });
+            }
+        }
         stats.block_done(start.elapsed().as_nanos() as u64);
+    }
+
+    /// Run queued triggers on the running plan; keep the ones whose node isn't in it yet.
+    fn apply_commands(&mut self) {
+        for slot in &mut self.pending {
+            if let Some((cmd, left)) = slot {
+                if Self::apply(&mut self.plan, *cmd) {
+                    *slot = None;
+                } else if *left == 0 {
+                    *slot = None; // its plan never came: drop it
+                } else {
+                    *left -= 1;
+                }
+            }
+        }
+        while let Ok(cmd) = self.commands.pop() {
+            if !Self::apply(&mut self.plan, cmd)
+                && let Some(free) = self.pending.iter_mut().find(|p| p.is_none())
+            {
+                *free = Some((cmd, PENDING_BLOCKS));
+            }
+        }
+    }
+
+    fn apply(plan: &mut RenderPlan, cmd: Command) -> bool {
+        let Some(c) = plan.clip_mut(cmd.node) else { return false };
+        c.state.apply(cmd.action, c.settings, &c.data, c.stream.as_mut());
+        true
     }
 }
 

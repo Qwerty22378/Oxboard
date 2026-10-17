@@ -1,0 +1,9 @@
+[package]
+name = "sb-ring"
+version = "0.1.0"
+description = "Shared-memory audio ring layout and data-plane ABI between the soundboard engine and its driver (no_std)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
