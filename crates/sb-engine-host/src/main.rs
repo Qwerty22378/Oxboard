@@ -27,7 +27,7 @@ mod win {
     use sb_engine::rt::mix_thread::MixThread;
     use sb_engine::rt::stats::MixSnapshot;
     use sb_engine_host::host::{Backend, Exit, HostConfig, MixHandle, Started, serve};
-    use sb_engine_host::pipe::Pipe;
+    use sb_pipe::Pipe;
     use sb_ring::ioctl::Direction;
 
     struct Wasapi {

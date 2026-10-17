@@ -1,0 +1,19 @@
+[package]
+name = "sb-pipe"
+version = "0.1.0"
+description = "Windows named pipes for the soundboard's links: owner-only, local-only, overlapped I/O"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",  # SDDL for the pipe's DACL
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",               # overlapped I/O
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+]

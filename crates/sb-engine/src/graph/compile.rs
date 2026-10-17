@@ -211,6 +211,13 @@ pub fn compile(
     compile_against(spec, block, tables, endpoints, &Layout::default(), Mode::Settle)
 }
 
+/// Everything `compile` checks about `spec` without opening anything: ids, edges, params,
+/// meters, the master, cycles. The controller's tests run every graph it builds through this.
+pub fn check(spec: &GraphSpec, tables: &Tables) -> Result<(), GraphError> {
+    let g = validate(spec, tables)?;
+    topo_order(&g).map(drop)
+}
+
 /// Compile `spec` to replace the plan described by `prev`. On error nothing it opened stays
 /// open, and the running plan is untouched.
 pub fn compile_against(

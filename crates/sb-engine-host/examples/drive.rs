@@ -26,7 +26,7 @@ fn main() {
 mod win {
     use sb_engine::backend::wasapi::{self, ComGuard, Direction};
     use sb_engine_host::client::EngineClient;
-    use sb_engine_host::pipe::{Pipe, PipeWriter};
+    use sb_pipe::{Pipe, PipeWriter};
     use sb_shared::events::EngineEvent;
     use sb_shared::graph::*;
     use std::process::{Child, Command};

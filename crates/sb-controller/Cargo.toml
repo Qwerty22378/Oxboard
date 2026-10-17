@@ -1,0 +1,16 @@
+[package]
+name = "sb-controller"
+version = "0.1.0"
+description = "The soundboard's brain: owns all state, serves the UI, drives the engine, Windows and the driver"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sb-shared.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+sb-pipe.workspace = true
+
+[dev-dependencies]
+sb-engine.workspace = true   # graph::compile::check: every graph the controller builds must pass the engine's rules

@@ -5,9 +5,8 @@
 //! - [`host`]: the serving loop, independent of transport and audio backend (tested on Linux
 //!   over a socket pair).
 //! - [`client`]: the controller's side of the protocol.
-//! - `pipe` (Windows): the named pipe, owner-only and local-only.
+//!
+//! The Windows named pipe itself is `sb_pipe`.
 
 pub mod client;
 pub mod host;
-#[cfg(windows)]
-pub mod pipe;

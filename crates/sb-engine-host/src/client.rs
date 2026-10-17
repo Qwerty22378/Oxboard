@@ -1,5 +1,5 @@
 //! The controller's side of the engine pipe: handshake, requests, and the event stream.
-//! Transport-agnostic (any `Read` + `Write` pair); `pipe::connect` gives the Windows one.
+//! Transport-agnostic (any `Read` + `Write` pair); `sb_pipe::Pipe::connect` gives the Windows one.
 
 use sb_shared::events::EngineEvent;
 use sb_shared::graph::{ClipAction, GraphError, GraphSpec, NodeId, ParamId};

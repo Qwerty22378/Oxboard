@@ -40,6 +40,7 @@ tools/vm/win-cargo.sh run -p sb-engine --release --example mix -- --out "high de
 tools/vm/win-cargo.sh run -p sb-engine --release --features driver --example virtual -- --out "high definition"   # E7, fake driver
 tools/vm/win-cargo.sh run -p sb-engine --release --example clips -- 'C:\src\clips\Example.ogg' --out "high definition"   # E8 (copy a clip there first)
 tools/vm/win-cargo.sh build --release -p sb-engine-host --bins --examples   # E9: then run target\release\examples\drive.exe on sb-build
+tools/vm/win-cargo.sh build --release -p sb-controller --bins --examples   # C1: on sb-build, start target\release\sb-controller.exe --fake-devices --log, then examples\ctl.exe show | watch | select ... (see ctl.rs)
 ```
 
 Other commands: `vm.sh status | start | stop | ssh <role> [cmd] | view <role> | seal | revert | password`.
