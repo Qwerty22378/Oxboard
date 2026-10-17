@@ -11,18 +11,34 @@
 //! command go out *after* that diff, so a UI seeing `Completed` already has the new state.
 //!
 //! It also recompiles the graph and works out what the engine needs: nothing, a few params,
-//! or a new graph (with the next `graph_version`). Sending that is the engine link's job (C3);
-//! until then [`Actor::engine_updates`] collects it.
+//! or a new graph (with the next `graph_version`), and hands that to the engine link
+//! ([`crate::engine_link`]). Without a link (tests), [`Actor::engine_updates`] collects it.
+//! App levels changed in desired state go to the Windows side the same way ([`WinMsg`]).
+//!
+//! A device the engine loses while Windows still lists it (held exclusively, a driver
+//! hiccup) is left out of the graph and tried again after a wait that doubles each time,
+//! from 1 s to 30 s. The output clock moves to another output meanwhile.
 
 use crate::commands;
 use crate::compile::{Compiled, Continuity, Update, compile};
+use crate::engine_link::{EngineReport, LinkMsg};
 use crate::hub::{ClientId, Hub};
-use crate::state::{AppState, Observation};
+use crate::state::{AppState, Failed, Observation};
 use crate::view::project;
-use sb_shared::ui::{StateView, UiMessage, UiRequest, diff};
+use crate::watch::WinMsg;
+use sb_shared::events::EngineEvent;
+use sb_shared::graph::ClipAction;
+use sb_shared::ui::{
+    AppKey, ClipId, Command, EngineStatus, ErrorInfo, ErrorKind, Level, StateView, UiMessage, UiRequest, diff,
+};
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
-use std::time::Instant;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
+
+/// The first wait before trying a lost device again; it doubles per loss up to [`RETRY_MAX`].
+pub const RETRY_FIRST: Duration = Duration::from_secs(1);
+pub const RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum Msg {
@@ -39,6 +55,10 @@ pub enum Msg {
         client: ClientId,
     },
     Observed(Observation),
+    /// Several at once (a scan of Windows), published as one change.
+    ObservedAll(Vec<Observation>),
+    /// From the engine link.
+    Engine(EngineReport),
     /// Stop the actor (the controller is exiting).
     Stop,
 }
@@ -60,6 +80,10 @@ pub struct Actor {
     /// The graph as last compiled.
     compiled: Compiled,
     engine_updates: Vec<EngineUpdate>,
+    engine: Option<Sender<LinkMsg>>,
+    windows: Option<Sender<WinMsg>>,
+    /// App levels as last sent to Windows.
+    sent_levels: BTreeMap<AppKey, Level>,
 }
 
 /// What the engine has to be told, in order.
@@ -83,12 +107,35 @@ impl Actor {
             continuity: Continuity::default(),
             compiled: Compiled::default(),
             engine_updates: Vec::new(),
+            engine: None,
+            windows: None,
+            sent_levels: BTreeMap::new(),
         };
         a.recompile();
         a
     }
 
-    /// Updates for the engine since the last call, oldest first.
+    /// Drive an engine through this link: it gets the current graph now, then every update.
+    pub fn with_engine(mut self, link: Sender<LinkMsg>) -> Self {
+        self.engine_updates.clear();
+        self.state.graph_version += 1;
+        let _ = link.send(LinkMsg::Update(EngineUpdate::Graph {
+            version: self.state.graph_version,
+            compiled: self.compiled.clone(),
+        }));
+        self.engine = Some(link);
+        self
+    }
+
+    /// Apply app levels through the Windows side (the COM thread): the current ones now, then
+    /// every change.
+    pub fn with_windows(mut self, win: Sender<WinMsg>) -> Self {
+        self.windows = Some(win);
+        self.sync_windows();
+        self
+    }
+
+    /// Updates for the engine since the last call, oldest first (when there's no link).
     pub fn engine_updates(&mut self) -> Vec<EngineUpdate> {
         std::mem::take(&mut self.engine_updates)
     }
@@ -110,14 +157,53 @@ impl Actor {
     /// Handle messages until [`Msg::Stop`] or until every sender is gone. Returns the final
     /// state (for the clean-exit work: saving, restoring defaults).
     pub fn run(mut self, inbox: Receiver<Msg>) -> AppState {
-        for msg in inbox {
+        loop {
+            let msg = match self.next_retry() {
+                Some(at) => match inbox.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                    Ok(m) => m,
+                    Err(RecvTimeoutError::Timeout) => {
+                        self.retry_due(Instant::now());
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                },
+                None => match inbox.recv() {
+                    Ok(m) => m,
+                    Err(_) => break,
+                },
+            };
             if matches!(msg, Msg::Stop) {
                 self.trace(&msg);
                 break;
             }
             self.handle(msg);
         }
+        if let Some(w) = &self.windows {
+            let _ = w.send(WinMsg::Stop);
+        }
         self.state
+    }
+
+    /// When the next failed device is due to be tried again.
+    pub fn next_retry(&self) -> Option<Instant> {
+        self.state.observed.failed.values().filter_map(|f| f.retry_at).min()
+    }
+
+    /// Put failed devices whose wait is over back into the graph.
+    pub fn retry_due(&mut self, now: Instant) {
+        let mut any = false;
+        for (key, f) in &mut self.state.observed.failed {
+            if f.retry_at.is_some_and(|t| t <= now) {
+                f.retry_at = None;
+                any = true;
+                if self.log {
+                    eprintln!("             trying {} again", key.0);
+                }
+            }
+        }
+        if any {
+            self.publish();
+        }
     }
 
     pub fn handle(&mut self, msg: Msg) {
@@ -144,7 +230,7 @@ impl Actor {
                 req: UiRequest::Command { id, cmd },
             } => {
                 self.hub.send(client, UiMessage::Accepted(id));
-                let reply = match commands::apply(&mut self.state, cmd) {
+                let reply = match self.command(cmd) {
                     Ok(()) => UiMessage::Completed(id),
                     Err(e) => UiMessage::Failed(id, e),
                 };
@@ -154,9 +240,96 @@ impl Actor {
                 self.hub.remove(client);
             }
             Msg::Observed(o) => self.state.observe(o),
+            Msg::ObservedAll(all) => all.into_iter().for_each(|o| self.state.observe(o)),
+            Msg::Engine(r) => self.engine_report(r),
             Msg::Stop => {}
         }
         self.publish();
+    }
+
+    fn command(&mut self, cmd: Command) -> Result<(), ErrorInfo> {
+        match cmd {
+            Command::PlayClip { id } => self.trigger(id, ClipAction::Play),
+            Command::StopClip { id } => self.trigger(id, ClipAction::Stop),
+            Command::RestartEngine => match &self.engine {
+                Some(link) => {
+                    let _ = link.send(LinkMsg::Restart);
+                    Ok(())
+                }
+                None => Err(ErrorInfo::new(
+                    ErrorKind::Unavailable,
+                    "this controller runs without an engine",
+                )),
+            },
+            Command::RemoveClip { id } => {
+                commands::apply(&mut self.state, cmd)?;
+                self.state.observed.playing.remove(&id);
+                Ok(())
+            }
+            cmd => commands::apply(&mut self.state, cmd),
+        }
+    }
+
+    fn trigger(&mut self, id: ClipId, action: ClipAction) -> Result<(), ErrorInfo> {
+        let unavailable = |m: &str| Err(ErrorInfo::new(ErrorKind::Unavailable, m));
+        if !self.state.desired.clips.contains_key(&id) {
+            return Err(ErrorInfo::new(ErrorKind::NotFound, format!("no clip {}", id.0)));
+        }
+        let Some(link) = &self.engine else {
+            return unavailable("this controller runs without an engine");
+        };
+        if !matches!(self.state.observed.engine, EngineStatus::Running { .. }) {
+            return unavailable("the engine isn't running");
+        }
+        // Every clip has a node (compiled in the same message that added it, sent before this).
+        let Some(&node) = self.compiled.clips.get(&id) else {
+            return unavailable("the clip isn't in the engine's graph");
+        };
+        let _ = link.send(LinkMsg::Trigger { node, action });
+        if action == ClipAction::Play {
+            self.state.observed.playing.insert(id);
+        }
+        Ok(())
+    }
+
+    fn engine_report(&mut self, r: EngineReport) {
+        match r {
+            EngineReport::Status(s) => {
+                if !matches!(s, EngineStatus::Running { .. }) {
+                    // A new host starts silent.
+                    self.state.observed.playing.clear();
+                }
+                self.state.observed.engine = s;
+            }
+            EngineReport::Event(EngineEvent::ClipEnded { node, .. }) => {
+                if let Some((id, _)) = self.compiled.clips.iter().find(|(_, n)| **n == node) {
+                    self.state.observed.playing.remove(id);
+                }
+            }
+            EngineReport::Event(EngineEvent::DeviceLost { node }) => {
+                if let Some(key) = self.compiled.devices.get(&node) {
+                    let f = self.state.observed.failed.entry(key.clone()).or_insert(Failed {
+                        attempts: 0,
+                        retry_at: None,
+                    });
+                    // Lost again while out of the graph: an old graph's event.
+                    if f.retry_at.is_none() {
+                        f.attempts += 1;
+                        let wait = RETRY_FIRST.saturating_mul(1 << (f.attempts - 1).min(8)).min(RETRY_MAX);
+                        f.retry_at = Some(Instant::now() + wait);
+                        if self.log {
+                            eprintln!("             {} lost; trying again in {wait:?}", key.0);
+                        }
+                    }
+                }
+            }
+            // Xrun, MasterClockFallback: facts for the log. (The master moves on its own when
+            // its device fails: the graph leaves the device out and picks another clock.)
+            EngineReport::Event(_) => {}
+            EngineReport::Refused { version, error } => {
+                eprintln!("controller: BUG: the engine refused graph v{version}: {error}");
+            }
+        }
     }
 
     fn recompile(&mut self) {
@@ -212,8 +385,27 @@ impl Actor {
         self.compiled = next;
     }
 
+    fn sync_windows(&mut self) {
+        let Some(win) = &self.windows else { return };
+        for (app, level) in &self.state.desired.app_levels {
+            if self.sent_levels.get(app) != Some(level) {
+                let _ = win.send(WinMsg::SetAppLevel {
+                    app: app.clone(),
+                    level: *level,
+                });
+                self.sent_levels.insert(app.clone(), *level);
+            }
+        }
+    }
+
     fn publish(&mut self) {
         self.recompile();
+        if let Some(link) = &self.engine {
+            for u in self.engine_updates.drain(..) {
+                let _ = link.send(LinkMsg::Update(u));
+            }
+        }
+        self.sync_windows();
         let view = project(&self.state);
         let ops = diff(&self.view, &view);
         if !ops.is_empty() {
@@ -389,6 +581,127 @@ mod tests {
         assert_eq!(m.view.master.gain, 19.0 / 20.0);
         // Its reader notices the close and reports it; that's harmless now.
         a.handle(Msg::UiDisconnected { client: 2 });
+    }
+
+    fn mic() -> DeviceKey {
+        DeviceKey("{0.0.1.00000000}.{mic}".into())
+    }
+
+    fn game() -> AppKey {
+        AppKey(r"C:\Games\game.exe".into())
+    }
+
+    fn level(gain: f32) -> Level {
+        Level { gain, muted: false }
+    }
+
+    #[test]
+    fn app_levels_go_to_windows_and_changes_made_there_are_followed() {
+        let (a, _hub) = with_speakers();
+        let (tx, rx) = mpsc::channel();
+        let mut a = a.with_windows(tx);
+        a.handle(Msg::ObservedAll(vec![
+            Observation::SessionAdded {
+                app: game(),
+                name: "Game".into(),
+                pid: 7,
+            },
+            Observation::AppLevel {
+                app: game(),
+                level: level(0.4),
+            },
+        ]));
+        // Windows' own level shows, and nothing is sent back: the user hasn't set one here.
+        assert_eq!(project(a.state()).apps[&game()].level, level(0.4));
+        assert!(rx.try_recv().is_err());
+        a.handle(cmd(
+            1,
+            1,
+            Command::SetAppGain {
+                app: game(),
+                gain: 0.25,
+            },
+        ));
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            [WinMsg::SetAppLevel {
+                app: game(),
+                level: level(0.25)
+            }]
+        );
+        // Above 1 isn't a session volume.
+        a.handle(cmd(1, 2, Command::SetAppGain { app: game(), gain: 1.5 }));
+        assert_eq!(a.state().desired.app_levels[&game()], level(0.25));
+        // The user drags the app in the Windows mixer: that's the level now.
+        a.handle(Msg::Observed(Observation::AppLevel {
+            app: game(),
+            level: level(0.9),
+        }));
+        assert_eq!(a.state().desired.app_levels[&game()], level(0.9));
+        assert_eq!(project(a.state()).apps[&game()].level, level(0.9));
+        // Saying it back is harmless (Windows has it already) and keeps the queue in order
+        // behind any fader move still on its way.
+        assert_eq!(rx.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn a_lost_device_leaves_the_graph_and_is_tried_again_later_and_later() {
+        let (mut a, _hub) = with_speakers();
+        a.handle(Msg::Observed(Observation::DeviceAdded {
+            key: mic(),
+            info: DeviceInfo {
+                name: "Mic".into(),
+                flow: Flow::Capture,
+            },
+        }));
+        a.handle(cmd(
+            1,
+            1,
+            Command::SetSystemInput(Some(sb_shared::ui::SystemInput::Device(mic()))),
+        ));
+        a.handle(cmd(
+            1,
+            2,
+            Command::SelectOutput {
+                device: speakers(),
+                selected: true,
+            },
+        ));
+        let node = *a.compiled().devices.iter().find(|(_, k)| **k == speakers()).unwrap().0;
+        let lose = |a: &mut Actor| a.handle(Msg::Engine(EngineReport::Event(EngineEvent::DeviceLost { node })));
+        lose(&mut a);
+        assert!(
+            !a.compiled().devices.values().any(|k| *k == speakers()),
+            "out of the graph"
+        );
+        assert!(project(a.state()).devices[&speakers()].failed);
+        let first = a.next_retry().unwrap();
+        let wait = first - Instant::now();
+        assert!(wait > Duration::from_millis(900) && wait <= RETRY_FIRST, "{wait:?}");
+        // A late event about the same node changes nothing while it's out.
+        lose(&mut a);
+        assert_eq!(a.next_retry(), Some(first));
+
+        a.retry_due(first);
+        assert!(a.compiled().devices.values().any(|k| *k == speakers()), "back in");
+        assert!(!project(a.state()).devices[&speakers()].failed);
+        assert_eq!(a.next_retry(), None);
+        let node = *a.compiled().devices.iter().find(|(_, k)| **k == speakers()).unwrap().0;
+        a.handle(Msg::Engine(EngineReport::Event(EngineEvent::DeviceLost { node })));
+        let wait = a.next_retry().unwrap() - Instant::now();
+        assert!(wait > Duration::from_millis(1900), "doubled: {wait:?}");
+
+        // Unplugged and plugged back in: a fresh start.
+        a.handle(Msg::Observed(Observation::DeviceRemoved { key: speakers() }));
+        a.handle(Msg::Observed(Observation::DeviceAdded {
+            key: speakers(),
+            info: DeviceInfo {
+                name: "Speakers".into(),
+                flow: Flow::Render,
+            },
+        }));
+        assert_eq!(a.next_retry(), None);
+        assert!(a.compiled().devices.values().any(|k| *k == speakers()));
     }
 
     #[test]

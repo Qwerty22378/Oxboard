@@ -8,6 +8,8 @@
 //!   ctl level APP GAIN | ctl level APP mute|unmute
 //!   ctl route SOURCE SINK GAIN|off     SOURCE: a device, an app, or "clips"
 //!   ctl clip-add PATH [NAME] | ctl clip-rm ID
+//!   ctl play ID | ctl stop ID          trigger a clip
+//!   ctl restart-engine
 //!
 //! DEVICE, APP, SOURCE and SINK match names, case-insensitively, by substring.
 
@@ -91,9 +93,10 @@ fn run() -> Result<(), String> {
             path: path.to_string(),
             name: name.to_string(),
         },
-        ["clip-rm", id] => Command::RemoveClip {
-            id: ClipId(id.parse().map_err(|_| format!("bad clip id {id}"))?),
-        },
+        ["clip-rm", id] => Command::RemoveClip { id: clip(id)? },
+        ["play", id] => Command::PlayClip { id: clip(id)? },
+        ["stop", id] => Command::StopClip { id: clip(id)? },
+        ["restart-engine"] => Command::RestartEngine,
         _ => return Err("unknown command (see the top of examples/ctl.rs)".into()),
     };
     let before = c.mirror.view.clone();
@@ -114,6 +117,13 @@ fn switch(s: &str) -> Result<bool, String> {
         "off" | "false" | "0" => Ok(false),
         _ => Err(format!("{s}: on or off")),
     }
+}
+
+fn clip(s: &str) -> Result<ClipId, String> {
+    s.trim_start_matches('#')
+        .parse()
+        .map(ClipId)
+        .map_err(|_| format!("bad clip id {s}"))
 }
 
 fn number(s: &str) -> Result<f32, String> {
@@ -213,12 +223,13 @@ fn show(v: &StateView) {
     println!("devices:");
     for d in v.devices.values() {
         println!(
-            "  {} {:<24} {:?}{}{}",
+            "  {} {:<24} {:?}{}{}{}",
             if d.selected { "[x]" } else { "[ ]" },
             d.name,
             d.flow,
             if d.present { "" } else { "  (not connected)" },
-            if d.loops { "  (would loop)" } else { "" }
+            if d.loops { "  (would loop)" } else { "" },
+            if d.failed { "  (won't open, retrying)" } else { "" }
         );
     }
     println!("apps:");
@@ -242,23 +253,38 @@ fn show(v: &StateView) {
     }
     println!("clips:");
     for (id, c) in &v.clips {
-        println!("  #{} {:<20} {} {}", id.0, c.settings.name, db(c.settings.gain), c.path);
+        println!(
+            "  #{} {:<20} {} {}{}",
+            id.0,
+            c.settings.name,
+            db(c.settings.gain),
+            c.path,
+            if c.playing { "  (playing)" } else { "" }
+        );
     }
 }
 
 fn describe(v: &StateView, op: &DiffOp) -> String {
     match op {
         DiffOp::Device(_, Some(d)) => format!(
-            "device {}: {}{}{}",
+            "device {}: {}{}{}{}",
             d.name,
             if d.selected { "selected" } else { "not selected" },
             if d.present { "" } else { ", not connected" },
-            if d.loops { ", would loop" } else { "" }
+            if d.loops { ", would loop" } else { "" },
+            if d.failed { ", won't open (retrying)" } else { "" }
         ),
         DiffOp::Device(k, None) => format!("device {} gone", k.0),
         DiffOp::App(_, Some(a)) => format!("app {}: {} ({} sessions)", a.name, level(a.level), a.sessions),
         DiffOp::App(k, None) => format!("app {} gone", k.0),
-        DiffOp::Clip(id, Some(c)) => format!("clip #{} {}: {} {}", id.0, c.settings.name, db(c.settings.gain), c.path),
+        DiffOp::Clip(id, Some(c)) => format!(
+            "clip #{} {}: {} {}{}",
+            id.0,
+            c.settings.name,
+            db(c.settings.gain),
+            c.path,
+            if c.playing { " (playing)" } else { "" }
+        ),
         DiffOp::Clip(id, None) => format!("clip #{} removed", id.0),
         DiffOp::Route(from, to, g) => format!(
             "route {} -> {}: {}",

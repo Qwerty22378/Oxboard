@@ -146,6 +146,9 @@ pub struct DeviceView {
     /// Selecting it would feed the PC's sound back into itself (it loops back into the
     /// system input). The UI greys the toggle out.
     pub loops: bool,
+    /// Windows lists it but the engine couldn't keep it open; it's out of the mix and being
+    /// retried.
+    pub failed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -323,6 +326,16 @@ pub enum Command {
         id: ClipId,
         settings: ClipSettings,
     },
+    /// Start the clip (what happens to voices already playing is its `retrigger`).
+    PlayClip {
+        id: ClipId,
+    },
+    /// Fade out every voice of the clip.
+    StopClip {
+        id: ClipId,
+    },
+    /// Restart the engine now: after it gave up (`EngineStatus::Failed`), or to start afresh.
+    RestartEngine,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -501,6 +514,7 @@ mod tests {
                             present: r.below(2) == 0,
                             selected: flow == Flow::Render && r.below(2) == 0,
                             loops: r.below(5) == 0,
+                            failed: r.below(7) == 0,
                         },
                     );
                 }

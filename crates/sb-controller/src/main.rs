@@ -1,17 +1,22 @@
-//! `sb-controller [--address ADDR] [--fake-devices] [--log]`
+//! `sb-controller [--address ADDR] [--engine EXE | --no-engine] [--fake-driver] [--fake-devices] [--log]`
 //!
 //! Serves UIs on `ADDR` (default: the per-user pipe `\\.\pipe\sb-controller-USER` on Windows,
 //! a socket in `$XDG_RUNTIME_DIR` elsewhere) until killed. Exits with 1 if it can't serve
 //! there (most likely another controller is running).
 //!
-//! `--fake-devices` makes up a few devices and running apps until device enumeration exists
-//! (C4), so a UI has something to show (a VB-Cable among them). `--log` prints every message
-//! the actor handles, and every graph or param update it would send the engine.
+//! On Windows it runs the engine host `EXE` (default: `sb-engine-host.exe` next to this
+//! program), restarting it if it dies; `--fake-driver` is passed on to it. Elsewhere, and with
+//! `--no-engine`, there's no engine: the UI side only.
+//!
+//! On Windows it watches the real devices and app sessions, and sets app levels as Windows
+//! session volumes. `--fake-devices` makes some up instead (a VB-Cable among them), there and
+//! elsewhere. `--log` prints every message the actor handles, and every graph or param update
+//! it sends the engine.
 
-use sb_controller::Controller;
 use sb_controller::actor::Msg;
 use sb_controller::state::{AppState, DeviceInfo, Loopback, Observation};
 use sb_controller::transport;
+use sb_controller::{Controller, Options};
 use sb_shared::ui::{AppKey, DeviceKey, Flow};
 
 fn fake_world() -> Vec<Observation> {
@@ -51,12 +56,19 @@ fn fake_world() -> Vec<Observation> {
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut address, mut fake, mut log) = (transport::default_address(), false, false);
+    let (mut engine, mut no_engine, mut fake_driver) = (None, false, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--address" => match args.next() {
                 Some(v) => address = v,
                 None => usage(),
             },
+            "--engine" => match args.next() {
+                Some(v) => engine = Some(std::path::PathBuf::from(v)),
+                None => usage(),
+            },
+            "--no-engine" => no_engine = true,
+            "--fake-driver" => fake_driver = true,
             "--fake-devices" => fake = true,
             "--log" => log = true,
             _ => usage(),
@@ -69,7 +81,16 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let controller = Controller::start(listener, AppState::default(), log);
+    let opts = Options {
+        log,
+        engine: if no_engine {
+            None
+        } else {
+            engine_spawner(engine, fake_driver)
+        },
+        windows: !fake && cfg!(windows),
+    };
+    let controller = Controller::launch(listener, AppState::default(), opts);
     if fake {
         for o in fake_world() {
             let _ = controller.inbox.send(Msg::Observed(o));
@@ -80,7 +101,45 @@ fn main() {
     controller.join();
 }
 
+#[cfg(windows)]
+fn engine_spawner(
+    engine: Option<std::path::PathBuf>,
+    fake_driver: bool,
+) -> Option<(
+    Box<dyn sb_controller::engine_link::Spawn>,
+    sb_controller::engine_link::LinkConfig,
+)> {
+    use sb_controller::engine_link::{LinkConfig, ProcessSpawner};
+    let exe = engine.unwrap_or_else(|| {
+        let me = std::env::current_exe().unwrap_or_default();
+        me.with_file_name("sb-engine-host.exe")
+    });
+    let args = if fake_driver {
+        vec!["--fake-driver".to_string()]
+    } else {
+        vec![]
+    };
+    eprintln!("engine host: {}", exe.display());
+    Some((Box::new(ProcessSpawner::new(exe, args)), LinkConfig::default()))
+}
+
+#[cfg(not(windows))]
+fn engine_spawner(
+    engine: Option<std::path::PathBuf>,
+    _fake_driver: bool,
+) -> Option<(
+    Box<dyn sb_controller::engine_link::Spawn>,
+    sb_controller::engine_link::LinkConfig,
+)> {
+    if engine.is_some() {
+        eprintln!("the engine host only runs on Windows; running without an engine");
+    }
+    None
+}
+
 fn usage() -> ! {
-    eprintln!("usage: sb-controller [--address ADDR] [--fake-devices] [--log]");
+    eprintln!(
+        "usage: sb-controller [--address ADDR] [--engine EXE | --no-engine] [--fake-driver] [--fake-devices] [--log]"
+    );
     std::process::exit(2);
 }

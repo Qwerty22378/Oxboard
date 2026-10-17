@@ -11,7 +11,7 @@
 //! - `Heartbeat` every [`HostConfig::heartbeat_every`], whatever else is going on.
 //!
 //! The engine starts with the first graph (using its master device, so the mix opens it up
-//! front). The host exits when the controller disconnects or asks it to, or if the mix
+//! front; on the timer if that device won't open). The host exits when the controller disconnects or asks it to, or if the mix
 //! thread dies.
 
 use sb_engine::engine::Engine;
@@ -201,7 +201,16 @@ impl<E: Endpoints> Host<E> {
         match req.body {
             RequestBody::ApplyGraph { graph, version } => {
                 if self.running.is_none() {
-                    match backend.start(self.cfg.block, self.tables.clone(), master_device(&graph)) {
+                    // A master that won't open (unplugged, held exclusively) mustn't keep the
+                    // engine from starting: start on the timer instead, as a running engine
+                    // falls back to it; the graph then reports the device like any other.
+                    let master = master_device(&graph);
+                    let (block, tables) = (self.cfg.block, &self.tables);
+                    let started = backend.start(block, tables.clone(), master).or_else(|e| match master {
+                        Some(_) => backend.start(block, tables.clone(), None).map_err(|_| e),
+                        None => Err(e),
+                    });
+                    match started {
                         Ok((engine, mix)) => self.running = Some(Running { engine, mix }),
                         Err(reason) => {
                             let err = sb_engine::graph::spec::GraphError::Endpoint {
@@ -334,97 +343,13 @@ fn master_device(spec: &GraphSpec) -> Option<&str> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::client::EngineClient;
-    use sb_engine::clock::master::MasterClock;
-    use sb_engine::graph::compile::EndpointKey;
+    use crate::silent::SilentBackend as TestBackend;
     use sb_engine::graph::spec::{
         ClipAction, EdgeSpec, GraphError, MeterSpec, NodeSpec, ParamId, ParamSpec, Retrigger,
     };
-    use sb_engine::rt::mix_thread::MixCore;
-    use sb_engine::rt::ring::{RingReader, RingWriter};
-    use sb_engine::rt::stats::MixStats;
+    use sb_shared::engine_client::EngineClient;
     use sb_shared::protocol::Hello;
     use std::os::unix::net::UnixStream;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-
-    /// No devices: tests use tones and clips, mastered on a device the clock "opens".
-    struct NoDevices;
-
-    impl Endpoints for NoDevices {
-        fn input(&mut self, _: NodeId, d: &str) -> Result<(RingReader, EndpointKey), String> {
-            Err(format!("no device {d} in tests"))
-        }
-        fn output(&mut self, _: NodeId, d: &str) -> Result<(RingWriter, EndpointKey), String> {
-            Err(format!("no device {d} in tests"))
-        }
-        fn release(&mut self, _: EndpointKey) {}
-    }
-
-    /// Plays the master bus nowhere, at about real time.
-    struct SilentClock(Instant);
-
-    impl MasterClock for SilentClock {
-        fn wait(&mut self) -> usize {
-            std::thread::sleep(Duration::from_micros(5333));
-            1
-        }
-        fn deliver(&mut self, _: &[f32], _: &[f32]) {}
-        fn set_master(&mut self, _: Option<&str>) {}
-        fn now_ns(&self) -> u64 {
-            self.0.elapsed().as_nanos() as u64
-        }
-    }
-
-    struct TestMix {
-        stats: Arc<MixStats>,
-        stop: Arc<AtomicBool>,
-        thread: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl MixHandle for TestMix {
-        fn stats(&self) -> MixSnapshot {
-            self.stats.snapshot()
-        }
-        fn is_finished(&self) -> bool {
-            self.thread.as_ref().is_none_or(|t| t.is_finished())
-        }
-    }
-
-    impl Drop for TestMix {
-        fn drop(&mut self) {
-            self.stop.store(true, Relaxed);
-            if let Some(t) = self.thread.take() {
-                let _ = t.join();
-            }
-        }
-    }
-
-    struct TestBackend;
-
-    impl Backend for TestBackend {
-        type E = NoDevices;
-        fn start(&mut self, block: usize, tables: Tables, master: Option<&str>) -> Result<Started<NoDevices>, String> {
-            let (engine, mut core): (_, MixCore) = Engine::with_master(block, tables, NoDevices, master);
-            let stats = Arc::new(MixStats::default());
-            let stop = Arc::new(AtomicBool::new(false));
-            let thread = {
-                let (stats, stop) = (stats.clone(), stop.clone());
-                std::thread::spawn(move || {
-                    let mut clock = SilentClock(Instant::now());
-                    sb_engine::rt::mix_thread::run(&mut core, &mut clock, &stats, &stop);
-                })
-            };
-            Ok((
-                engine,
-                Box::new(TestMix {
-                    stats,
-                    stop,
-                    thread: Some(thread),
-                }),
-            ))
-        }
-    }
 
     fn start_host(cfg: HostConfig) -> (EngineClient<UnixStream>, std::thread::JoinHandle<Exit>) {
         let (ours, theirs) = UnixStream::pair().unwrap();
@@ -581,6 +506,33 @@ mod tests {
             "{ev:?}"
         );
         drop(client); // controller goes away: the host must exit on its own
+        assert_eq!(host.join().unwrap(), Exit::Disconnected);
+    }
+
+    /// The silent backend, except that no master device opens.
+    struct NoMaster;
+
+    impl Backend for NoMaster {
+        type E = <TestBackend as Backend>::E;
+        fn start(&mut self, block: usize, tables: Tables, master: Option<&str>) -> Result<Started<Self::E>, String> {
+            match master {
+                Some(m) => Err(format!("{m}: Element not found.")),
+                None => TestBackend.start(block, tables, None),
+            }
+        }
+    }
+
+    #[test]
+    fn a_master_that_wont_open_still_starts_the_engine_on_the_timer() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let reader = theirs.try_clone().unwrap();
+        let host = std::thread::spawn(move || serve(NoMaster, reader, theirs, HostConfig::default()));
+        let mut client = EngineClient::connect(ours.try_clone().unwrap(), ours, "test").unwrap();
+        assert_eq!(client.apply_graph(graph(false), 1).unwrap(), Ok(()));
+        let ev = events_for(&mut client, Duration::from_millis(300));
+        assert!(ev.contains(&EngineEvent::GraphApplied { version: 1 }), "{ev:?}");
+        assert!((peak(&ev) - 0.5).abs() < 0.01, "and it plays: {}", peak(&ev));
+        drop(client);
         assert_eq!(host.join().unwrap(), Exit::Disconnected);
     }
 

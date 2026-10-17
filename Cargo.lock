@@ -178,8 +178,11 @@ name = "sb-controller"
 version = "0.1.0"
 dependencies = [
  "sb-engine",
+ "sb-engine-host",
  "sb-pipe",
  "sb-shared",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

@@ -11,6 +11,7 @@
 
 use sb_shared::ui::{AppKey, ClipId, ClipSettings, DeviceKey, EngineStatus, Flow, Level, Sink, Source, SystemInput};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
@@ -29,7 +30,9 @@ pub struct Desired {
     /// Interface 1: every output the system input plays to.
     pub outputs: BTreeSet<DeviceKey>,
     pub master: Level,
-    /// Per-app levels; apps without an entry play at unity.
+    /// Per-app levels set here (Windows session volumes, so 0 to 1): applied to the app's
+    /// sessions, now and at its next launch. A change made in Windows is followed. Apps without
+    /// an entry keep whatever Windows has.
     pub app_levels: BTreeMap<AppKey, Level>,
     /// Interface 2: each app's outputs. Only apps with an endpoint (`app_endpoints`) play.
     pub app_routes: BTreeMap<AppKey, BTreeSet<DeviceKey>>,
@@ -73,6 +76,17 @@ pub struct Observed {
     /// Render devices whose sound comes back in somewhere: a cable's input reappears on its
     /// output, a driver endpoint in the mix. Playing into one from its own source loops.
     pub loopbacks: BTreeMap<DeviceKey, Loopback>,
+    /// Devices Windows lists but the engine couldn't keep open (`DeviceLost`): left out of
+    /// the graph until `retry_at`, then tried again.
+    pub failed: BTreeMap<DeviceKey, Failed>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Failed {
+    /// Times lost since Windows last (re)added it; the wait doubles with each.
+    pub attempts: u32,
+    /// Out of the graph until then; `None` while it's being tried again.
+    pub retry_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,16 +113,19 @@ impl Default for Observed {
             playing: BTreeSet::new(),
             endpoints: BTreeMap::new(),
             loopbacks: BTreeMap::new(),
+            failed: BTreeMap::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AppSessions {
     /// Display name, from the session (or the executable's file name).
     pub name: String,
     /// One entry per open session, by its owner's PID.
     pub pids: BTreeSet<u32>,
+    /// The app's session volume, as Windows last reported it.
+    pub level: Option<Level>,
 }
 
 /// A change in the world, posted by whoever watches it (the COM thread, C4; tests).
@@ -140,6 +157,11 @@ pub enum Observation {
     Loopback {
         render: DeviceKey,
         into: Option<Loopback>,
+    },
+    /// An app's session volume, first seen or changed outside the controller.
+    AppLevel {
+        app: AppKey,
+        level: Level,
     },
 }
 
@@ -191,6 +213,12 @@ impl AppState {
             .or_else(|| self.desired.known_apps.get(key).map(String::as_str))
     }
 
+    /// Whether the graph can use the device: present, of that flow, and not failed.
+    pub fn usable(&self, key: &DeviceKey, flow: Flow) -> bool {
+        self.observed.devices.get(key).is_some_and(|i| i.flow == flow)
+            && self.observed.failed.get(key).is_none_or(|f| f.retry_at.is_none())
+    }
+
     /// Remember the device (and its current name) because desired state now refers to it.
     pub fn remember_device(&mut self, key: &DeviceKey) {
         if let Some(info) = self.observed.devices.get(key) {
@@ -211,10 +239,14 @@ impl AppState {
                 if let Some(known) = self.desired.known_devices.get_mut(&key) {
                     *known = info.clone();
                 }
-                self.observed.devices.insert(key, info);
+                // Back from Windows' point of view: a fresh start for the engine too.
+                if self.observed.devices.insert(key.clone(), info).is_none() {
+                    self.observed.failed.remove(&key);
+                }
             }
             Observation::DeviceRemoved { key } => {
                 self.observed.devices.remove(&key);
+                self.observed.failed.remove(&key);
             }
             Observation::SessionAdded { app, name, pid } => {
                 if let Some(known) = self.desired.known_apps.get_mut(&app) {
@@ -243,6 +275,16 @@ impl AppState {
                     Some(l) => self.observed.loopbacks.insert(render, l),
                     None => self.observed.loopbacks.remove(&render),
                 };
+            }
+            Observation::AppLevel { app, level } => {
+                if let Some(s) = self.observed.sessions.get_mut(&app) {
+                    s.level = Some(level);
+                }
+                // Option A: the session volume *is* the app's level, so a change made in
+                // Windows (the mixer, the app's own slider) is the user's latest word.
+                if let Some(l) = self.desired.app_levels.get_mut(&app) {
+                    *l = level;
+                }
             }
         }
     }

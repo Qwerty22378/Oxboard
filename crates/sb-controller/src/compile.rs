@@ -122,6 +122,8 @@ pub struct Compiled {
     pub meters: BTreeMap<MeterId, MeterTarget>,
     /// Each clip's node, for triggers.
     pub clips: BTreeMap<ClipId, NodeId>,
+    /// Each device node's device, for the engine's `DeviceLost`.
+    pub devices: BTreeMap<NodeId, DeviceKey>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,7 +188,7 @@ impl std::fmt::Display for CompileError {
 
 pub fn compile(state: &AppState, cont: &mut Continuity) -> Result<Compiled, CompileError> {
     let (d, o) = (&state.desired, &state.observed);
-    let present = |k: &DeviceKey, flow| o.devices.get(k).is_some_and(|i| i.flow == flow);
+    let present = |k: &DeviceKey, flow| state.usable(k, flow);
     let output = |k: &DeviceKey| present(k, Flow::Render).then(|| NodeKey::Output(k.clone()));
     let endpoint = |id: u32| {
         o.endpoints
@@ -244,7 +246,10 @@ pub fn compile(state: &AppState, cont: &mut Continuity) -> Result<Compiled, Comp
         let id = NodeId(cont.nodes.get(key).expect("node ids don't run out"));
         ids.insert(key.clone(), id);
         let kind = match key {
-            NodeKey::Input(k) => NodeKind::DeviceInput { device: k.0.clone() },
+            NodeKey::Input(k) => {
+                c.devices.insert(id, k.clone());
+                NodeKind::DeviceInput { device: k.0.clone() }
+            }
             NodeKey::Endpoint(e) => NodeKind::VirtualSource { endpoint: *e },
             NodeKey::Clip(clip) => {
                 let def = &d.clips[clip];
@@ -257,7 +262,10 @@ pub fn compile(state: &AppState, cont: &mut Continuity) -> Result<Compiled, Comp
                 }
             }
             NodeKey::ClipBus => NodeKind::Bus,
-            NodeKey::Output(k) => NodeKind::DeviceOutput { device: k.0.clone() },
+            NodeKey::Output(k) => {
+                c.devices.insert(id, k.clone());
+                NodeKind::DeviceOutput { device: k.0.clone() }
+            }
         };
         c.graph.nodes.push(NodeSpec { id, kind });
     }

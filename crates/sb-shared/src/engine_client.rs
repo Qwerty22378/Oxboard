@@ -1,9 +1,9 @@
 //! The controller's side of the engine pipe: handshake, requests, and the event stream.
 //! Transport-agnostic (any `Read` + `Write` pair); `sb_pipe::Pipe::connect` gives the Windows one.
 
-use sb_shared::events::EngineEvent;
-use sb_shared::graph::{ClipAction, GraphError, GraphSpec, NodeId, ParamId};
-use sb_shared::protocol::{Hello, HostMessage, PROTOCOL_VERSION, Request, RequestBody, read_frame, write_frame};
+use crate::events::EngineEvent;
+use crate::graph::{ClipAction, GraphError, GraphSpec, NodeId, ParamId};
+use crate::protocol::{Hello, HostMessage, PROTOCOL_VERSION, Request, RequestBody, read_frame, write_frame};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::mpsc;
@@ -23,20 +23,15 @@ pub struct EngineClient<W: Write> {
 }
 
 impl<W: Write> EngineClient<W> {
-    /// Say hello and start reading. Fails if the host refuses (mismatched builds) or hangs up.
+    /// Say hello and start reading. Fails if the host refuses (mismatched builds), hangs up, or
+    /// doesn't answer within the reply timeout (the reader thread then ends with the
+    /// connection: kill the host).
     pub fn connect(mut reader: impl Read + Send + 'static, mut writer: W, client: &str) -> Result<Self, String> {
         let hello = Hello {
             protocol: PROTOCOL_VERSION,
             client: client.into(),
         };
         write_frame(&mut writer, &hello).map_err(|e| format!("send hello: {e}"))?;
-        let host = match read_frame::<HostMessage>(&mut reader) {
-            Ok(Some(HostMessage::Welcome { host, .. })) => host,
-            Ok(Some(HostMessage::Refused { reason })) => return Err(format!("host refused: {reason}")),
-            Ok(Some(other)) => return Err(format!("unexpected first message: {other:?}")),
-            Ok(None) => return Err("host hung up during the handshake".into()),
-            Err(e) => return Err(format!("handshake: {e}")),
-        };
         let (tx, incoming) = mpsc::channel();
         std::thread::Builder::new()
             .name("sb-client-reader".into())
@@ -48,6 +43,13 @@ impl<W: Write> EngineClient<W> {
                 }
             })
             .map_err(|e| e.to_string())?;
+        let host = match incoming.recv_timeout(REPLY_TIMEOUT) {
+            Ok(HostMessage::Welcome { host, .. }) => host,
+            Ok(HostMessage::Refused { reason }) => return Err(format!("host refused: {reason}")),
+            Ok(other) => return Err(format!("unexpected first message: {other:?}")),
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err("no answer to the hello".into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("host hung up during the handshake".into()),
+        };
         Ok(Self {
             writer,
             incoming,

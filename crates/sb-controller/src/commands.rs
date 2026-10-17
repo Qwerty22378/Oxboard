@@ -2,7 +2,8 @@
 //! A command that would close a feedback loop ([`crate::loops`]) is refused too.
 //!
 //! Commands that also drive Windows, the driver or the engine (app routing, C5) become small
-//! state machines advanced by worker results; these ones finish on the spot.
+//! state machines advanced by worker results; these ones finish on the spot. The engine's
+//! one-shot commands (clip triggers, restarting it) are the actor's.
 
 use crate::loops;
 use crate::state::{AppState, ClipDef};
@@ -117,6 +118,11 @@ fn change(state: &mut AppState, cmd: Command) -> Outcome {
         Command::SetAppGain { app: key, gain: g } => {
             app(state, &key)?;
             gain(g)?;
+            if g > 1.0 {
+                return Err(invalid(format!(
+                    "an app's level is its Windows volume, so it goes up to 1 (asked for {g})"
+                )));
+            }
             state.remember_app(&key);
             state.desired.app_levels.entry(key).or_default().gain = g;
         }
@@ -182,6 +188,9 @@ fn change(state: &mut AppState, cmd: Command) -> Outcome {
                 Some(c) => c.settings = settings,
                 None => return Err(not_found(format!("no clip {}", id.0))),
             }
+        }
+        Command::PlayClip { .. } | Command::StopClip { .. } | Command::RestartEngine => {
+            return Err(ErrorInfo::new(ErrorKind::Internal, "the actor runs engine commands"));
         }
     }
     state.desired.prune_known();

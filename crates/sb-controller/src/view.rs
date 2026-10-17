@@ -28,6 +28,7 @@ pub fn project(state: &AppState) -> StateView {
                 present,
                 selected: info.flow == Flow::Render && d.outputs.contains(key),
                 loops: false,
+                failed: o.failed.get(key).is_some_and(|f| f.retry_at.is_some()),
             },
         );
     }
@@ -41,7 +42,12 @@ pub fn project(state: &AppState) -> StateView {
             key.clone(),
             AppView {
                 name: state.app_name(key).unwrap_or(&key.0).to_owned(),
-                level: d.app_levels.get(key).copied().unwrap_or(Level::UNITY),
+                level: d
+                    .app_levels
+                    .get(key)
+                    .copied()
+                    .or_else(|| o.sessions.get(key).and_then(|s| s.level))
+                    .unwrap_or(Level::UNITY),
                 sessions: o.sessions.get(key).map_or(0, |s| s.pids.len() as u32),
             },
         );
