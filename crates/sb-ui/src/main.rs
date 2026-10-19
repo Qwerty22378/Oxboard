@@ -1,10 +1,11 @@
-//! `sb-ui [--address ADDR] [--show] [--no-hotkey] [--gallery] [--log FILE]`
+//! `sb-ui [--address ADDR] [--show] [--hotkey] [--gallery] [--log FILE]`
 //!
 //! The overlay: starts hidden and connects to the controller at `ADDR` (default: the per-user
-//! pipe, as `sb-controller`), reconnecting whenever it's gone. Ctrl+Shift+S shows it over
-//! whatever is in front, and hides it again (so do Esc and a click outside).
+//! pipe, as `sb-controller`), reconnecting whenever it's gone. The controller starts it, owns
+//! the hotkey (Ctrl+Shift+S) and tells it to show or hide; Esc and a click outside hide it too.
 //!
-//! `--show` shows it at startup (development). `--no-hotkey` leaves the hotkey to someone else.
+//! `--show` shows it at startup (development). `--hotkey` registers Ctrl+Shift+S here instead,
+//! to run it without a controller's shell (`sb-controller --no-shell`).
 //! `--gallery` shows every widget against made-up state instead, with no controller.
 //! There's no console: `--log FILE` says what it's doing.
 
@@ -42,7 +43,7 @@ fn main() {
     shell.run(
         content,
         shell::Options {
-            hotkey: !flag("--no-hotkey"),
+            hotkey: flag("--hotkey"),
             show_at_start: flag("--show"),
         },
     );

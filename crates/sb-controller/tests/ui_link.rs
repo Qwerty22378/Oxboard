@@ -149,6 +149,7 @@ fn a_mismatched_ui_is_refused() {
         &UiHello {
             protocol: UI_PROTOCOL_VERSION + 1,
             client: "future".into(),
+            pid: std::process::id(),
         },
     )
     .unwrap();

@@ -2,9 +2,9 @@
 //! whenever the controller goes away), says hello, subscribes, and hands every message to the
 //! UI thread as a [`LinkEvent`], waking it. Sending is a frame write on the caller's thread.
 //!
-//! While the overlay is hidden ([`Link::set_visible`]) meters are dropped and nothing wakes
-//! the UI thread: state messages wait in the channel until it's shown again. A hidden overlay
-//! costs no CPU.
+//! While the overlay is hidden ([`Link::set_visible`]) meters are dropped and only the
+//! controller's `ToggleOverlay` (the hotkey) wakes the UI thread: state messages wait in the
+//! channel until it's shown again. A hidden overlay costs no CPU.
 
 use sb_controller::transport;
 use sb_shared::protocol::{read_frame, write_frame};
@@ -110,6 +110,7 @@ fn run(
         let hello = UiHello {
             protocol: UI_PROTOCOL_VERSION,
             client: client.into(),
+            pid: std::process::id(),
         };
         let welcome = write_frame(&mut w, &hello)
             .map_err(|e| e.to_string())
@@ -153,10 +154,12 @@ fn run(
             match read_frame::<UiMessage>(&mut reader) {
                 Ok(Some(UiMessage::Meters(_))) if !visible.load(Ordering::Relaxed) => {}
                 Ok(Some(msg)) => {
+                    // The hotkey wakes the UI even while hidden: that's how it gets shown.
+                    let urgent = matches!(msg, UiMessage::ToggleOverlay);
                     if events.send(LinkEvent::Message(msg)).is_err() {
                         return;
                     }
-                    if visible.load(Ordering::Relaxed) {
+                    if urgent || visible.load(Ordering::Relaxed) {
                         wake();
                     }
                 }

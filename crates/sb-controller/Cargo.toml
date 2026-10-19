@@ -26,12 +26,16 @@ features = [
     "Win32_Storage_FileSystem",         # version resources: an app's "File description"
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Console",             # Ctrl+C: stop cleanly
     "Win32_System_IO",                  # DeviceIoControl
     "Win32_System_Registry",            # the Windows build, for the per-app output API
     "Win32_System_Threading",           # OpenProcess, QueryFullProcessImageNameW
     "Win32_System_Variant",
     "Win32_System_WinRT",               # RoGetActivationFactory: AudioPolicyConfig
+    "Win32_UI_Input_KeyboardAndMouse",  # the overlay hotkey
+    "Win32_UI_Shell",                   # the tray icon
     "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",     # the shell's window, AllowSetForegroundWindow
 ]
 
 [dev-dependencies]

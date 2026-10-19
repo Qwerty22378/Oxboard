@@ -3,4 +3,6 @@
 //! it (scans, diffs, level bookkeeping) is [`crate::watch`], which builds and tests anywhere.
 
 pub mod com;
+pub mod defaults;
 pub mod policy;
+pub mod shell;

@@ -123,8 +123,8 @@ impl Store {
                 self.meters.clear();
                 self.meters.extend(levels.iter().cloned());
             }
-            // Only during the handshake, which the link handles.
-            UiMessage::Welcome { .. } | UiMessage::Refused { .. } => {}
+            // Only during the handshake, which the link handles; the app shows and hides.
+            UiMessage::Welcome { .. } | UiMessage::Refused { .. } | UiMessage::ToggleOverlay => {}
         }
         None
     }

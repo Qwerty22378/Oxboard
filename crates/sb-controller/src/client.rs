@@ -49,6 +49,7 @@ impl<W: Write> UiClient<W> {
         let hello = UiHello {
             protocol: UI_PROTOCOL_VERSION,
             client: client.into(),
+            pid: std::process::id(),
         };
         write_frame(&mut writer, &hello).map_err(|e| format!("send hello: {e}"))?;
         let controller = match read_frame::<UiMessage>(&mut reader) {

@@ -102,6 +102,7 @@ pub fn serve(conn: Connection, id: ClientId, hub: &Hub, inbox: &Inbox) {
         .send(Msg::UiConnected {
             client: id,
             name: hello.client,
+            pid: hello.pid,
         })
         .is_err()
     {

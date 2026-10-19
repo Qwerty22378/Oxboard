@@ -33,6 +33,12 @@ pub enum WinMsg {
         pids: Vec<u32>,
         device: Option<DeviceKey>,
     },
+    /// Make these Windows' default render devices (role by role). Answered with
+    /// `Msg::WinDone { op }`.
+    SetDefaults {
+        op: u64,
+        defaults: crate::defaults::DefaultsMap,
+    },
     /// Something changed (from a notification callback): scan again.
     Rescan {
         devices: bool,
@@ -68,6 +74,8 @@ pub struct World {
     pub devices: BTreeMap<DeviceKey, SeenDevice>,
     /// By session instance identifier (unique per session, across devices).
     pub sessions: BTreeMap<String, SeenSession>,
+    /// Windows' default render device per role.
+    pub defaults: crate::defaults::DefaultsMap,
 }
 
 /// The levels the controller set, per app, so its own changes aren't reported back.
@@ -110,10 +118,13 @@ pub fn cable_pairs(devices: &BTreeMap<DeviceKey, SeenDevice>) -> BTreeMap<Device
     }
     by_adapter
         .into_values()
-        .filter_map(|(r, c)| match (r.as_slice(), c.as_slice()) {
-            ([r], [c]) => Some(((*r).clone(), (*c).clone())),
+        // One way out, any number of ways in: VB-Cable 4.5 has "CABLE Input" and
+        // "CABLE In 16ch", both into "CABLE Output".
+        .filter_map(|(r, c)| match c.as_slice() {
+            [c] => Some(r.into_iter().map(|r| (r.clone(), (*c).clone())).collect::<Vec<_>>()),
             _ => None,
         })
+        .flatten()
         .collect()
 }
 
@@ -153,6 +164,10 @@ pub fn changes(old: &World, new: &World, levels: &mut Levels) -> Vec<Observation
                 into: Some(Loopback::Capture(capture.clone())),
             });
         }
+    }
+
+    if old.defaults != new.defaults {
+        out.push(Observation::Defaults(new.defaults.clone()));
     }
 
     // Sessions, as (app, pid): an app playing on two devices is one process, once.
@@ -340,10 +355,16 @@ mod tests {
             dev("a-out", Flow::Capture, "VB-Audio Virtual Cable A"),
             dev("headset-spk", Flow::Render, "USB Headset"),
             dev("headset-mic", Flow::Capture, "USB Headset"),
+            // VB-Cable 4.5: a second way in, to the same output.
+            dev("cable-16ch", Flow::Render, "VB-Audio Virtual Cable"),
         ]
         .into();
         let pairs = cable_pairs(&devices);
-        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(
+            pairs[&DeviceKey("{cable-16ch}".into())],
+            DeviceKey("{cable-out}".into())
+        );
         assert_eq!(pairs[&DeviceKey("{cable-in}".into())], DeviceKey("{cable-out}".into()));
         assert_eq!(pairs[&DeviceKey("{a-in}".into())], DeviceKey("{a-out}".into()));
 
@@ -354,7 +375,7 @@ mod tests {
         };
         let ch = changes(&World::default(), &w, &mut levels);
         let loops = ch.iter().filter(|o| matches!(o, Observation::Loopback { .. })).count();
-        assert_eq!(loops, 2);
+        assert_eq!(loops, 3);
         // Unplugging one cable's output ends its loop.
         let mut w2 = w.clone();
         w2.devices.remove(&DeviceKey("{a-out}".into()));

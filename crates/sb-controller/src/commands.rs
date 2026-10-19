@@ -190,6 +190,7 @@ fn change(state: &mut AppState, cmd: Command) -> Outcome {
             }
         }
         Command::DismissLoadError => state.observed.settings.load_error = None,
+        Command::SetKeepWindowsDefault(keep) => state.desired.keep_windows_default = keep,
         Command::PlayClip { .. } | Command::StopClip { .. } | Command::RestartEngine | Command::RouteApp { .. } => {
             return Err(ErrorInfo::new(
                 ErrorKind::Internal,

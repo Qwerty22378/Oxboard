@@ -12,6 +12,7 @@
 //!   ctl play ID | ctl stop ID          trigger a clip
 //!   ctl restart-engine
 //!   ctl dismiss                        clear the "settings couldn't be read" notice
+//!   ctl default take|keep              let the soundboard make the cable Windows' default output, or not
 //!
 //! DEVICE, APP, SOURCE and SINK match names, case-insensitively, by substring.
 
@@ -111,6 +112,8 @@ fn run() -> Result<(), String> {
         ["stop", id] => Command::StopClip { id: clip(id)? },
         ["restart-engine"] => Command::RestartEngine,
         ["dismiss"] => Command::DismissLoadError,
+        ["default", "take"] => Command::SetKeepWindowsDefault(false),
+        ["default", "keep"] => Command::SetKeepWindowsDefault(true),
         _ => return Err("unknown command (see the top of examples/ctl.rs)".into()),
     };
     let before = c.mirror.view.clone();
@@ -248,8 +251,27 @@ fn settings(s: &SettingsView) -> String {
     if out.is_empty() { "ok".into() } else { out.join("; ") }
 }
 
+fn default_output(v: &StateView) -> String {
+    let d = &v.default_output;
+    let name = d.target.as_ref().map_or("nothing".to_string(), |k| {
+        v.devices.get(k).map_or(k.0.clone(), |x| x.name.clone())
+    });
+    let mut s = match (d.wanted, d.owned, d.handed_back) {
+        (_, true, _) => format!("{name} (the soundboard holds it)"),
+        (true, false, true) => format!("given back while the engine is down (wants {name})"),
+        (true, false, false) => format!("taking it for {name}"),
+        (false, false, _) if d.target.is_none() => "left alone (no cable as the PC sound)".into(),
+        (false, false, _) => "left alone (keep)".into(),
+    };
+    if let Some(p) = &d.problem {
+        s.push_str(&format!("; failed: {p}"));
+    }
+    s
+}
+
 fn show(v: &StateView) {
     println!("engine: {:?}", v.engine);
+    println!("windows default output: {}", default_output(v));
     println!("settings: {}", settings(&v.settings));
     println!("master: {}", level(v.master));
     println!(
@@ -356,6 +378,7 @@ fn describe(v: &StateView, op: &DiffOp) -> String {
         DiffOp::Master(l) => format!("master: {}", level(*l)),
         DiffOp::Engine(e) => format!("engine: {e:?}"),
         DiffOp::Settings(s) => format!("settings: {}", settings(s)),
+        DiffOp::DefaultOutput(_) => format!("windows default output: {}", default_output(v)),
     }
 }
 

@@ -65,6 +65,9 @@ struct File {
     /// `device:{endpoint id}` or `endpoint:{driver endpoint}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     system_input: Option<String>,
+    /// Interface 1: leave Windows' default output alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    keep_windows_default: bool,
     #[serde(default)]
     outputs: Vec<String>,
     #[serde(default)]
@@ -184,6 +187,7 @@ impl File {
                 SystemInput::Device(k) => format!("device:{}", k.0),
                 SystemInput::Endpoint(id) => format!("endpoint:{id}"),
             }),
+            keep_windows_default: d.keep_windows_default,
             outputs: d.outputs.iter().map(|k| k.0.clone()).collect(),
             next_clip: d.next_clip,
             devices: d
@@ -266,6 +270,7 @@ impl File {
                 }
             }),
         };
+        d.keep_windows_default = self.keep_windows_default;
         d.outputs = self.outputs.into_iter().map(DeviceKey).collect();
         for (i, dev) in self.devices.into_iter().enumerate() {
             let flow = match dev.flow.as_str() {
@@ -595,6 +600,7 @@ mod tests {
             outputs: [dev("speakers"), dev("gone")].into(),
             master: Level { gain: 0.3, muted: true },
             next_clip: 7,
+            keep_windows_default: true,
             ..Desired::default()
         };
         d.app_levels.insert(

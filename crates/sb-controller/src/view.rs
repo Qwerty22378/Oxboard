@@ -13,6 +13,7 @@ pub fn project(state: &AppState) -> StateView {
         routes: d.matrix.clone(),
         system_input: d.system_input.clone(),
         settings: o.settings.clone(),
+        default_output: o.default_output.clone(),
         ..StateView::default()
     };
     // Present devices, plus the absent ones the user still has picked (greyed out).
@@ -31,8 +32,12 @@ pub fn project(state: &AppState) -> StateView {
                 selected: info.flow == Flow::Render && d.outputs.contains(key),
                 loops: false,
                 failed: o.failed.get(key).is_some_and(|f| f.retry_at.is_some()),
+                // One way in per cable: the one clips should use.
                 mic: info.flow == Flow::Render
-                    && matches!(o.loopbacks.get(key), Some(crate::state::Loopback::Capture(_))),
+                    && match o.loopbacks.get(key) {
+                        Some(crate::state::Loopback::Capture(c)) => state.feed_of(c).as_ref() == Some(key),
+                        _ => false,
+                    },
             },
         );
     }
@@ -107,11 +112,16 @@ mod tests {
             info: DeviceInfo { name: id.into(), flow },
         };
         for o in [
-            dev("cable-in", Flow::Render),
             dev("cable-out", Flow::Capture),
             dev("speakers", Flow::Render),
+            dev("CABLE In 16ch", Flow::Render),
+            dev("CABLE Input", Flow::Render),
             Observation::Loopback {
-                render: DeviceKey("cable-in".into()),
+                render: DeviceKey("CABLE In 16ch".into()),
+                into: Some(Loopback::Capture(DeviceKey("cable-out".into()))),
+            },
+            Observation::Loopback {
+                render: DeviceKey("CABLE Input".into()),
                 into: Some(Loopback::Capture(DeviceKey("cable-out".into()))),
             },
         ] {
@@ -119,7 +129,8 @@ mod tests {
         }
         let v = project(&s);
         let mic = |k: &str| v.devices[&DeviceKey(k.into())].mic;
-        assert!(mic("cable-in"));
+        assert!(mic("CABLE Input"), "the cable's main way in");
+        assert!(!mic("CABLE In 16ch"), "only one way in per cable gets the clips");
         assert!(!mic("speakers") && !mic("cable-out"));
     }
 }

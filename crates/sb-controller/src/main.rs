@@ -1,5 +1,5 @@
 //! `sb-controller [--address ADDR] [--engine EXE | --no-engine] [--config FILE | --no-config]
-//!                [--fake-driver] [--fake-devices] [--log]`
+//!                [--ui EXE | --no-ui] [--no-shell] [--fake-driver] [--fake-devices] [--log]`
 //!
 //! Serves UIs on `ADDR` (default: the per-user pipe `\\.\pipe\sb-controller-USER` on Windows,
 //! a socket in `$XDG_RUNTIME_DIR` elsewhere) until killed. Exits with 1 if it can't serve
@@ -12,6 +12,16 @@
 //! Windows, `~/.config/soundboard/config.toml` elsewhere) and saves them there as they change.
 //! `--no-config` starts from defaults and saves nothing; so does `--fake-devices` unless a
 //! `--config` is given, so made-up devices never end up in the real settings.
+//!
+//! On Windows it also runs the overlay `EXE` (default: `sb-ui.exe` next to this program, if
+//! it's there), restarting it if it dies; `--no-ui` doesn't. It owns the overlay hotkey
+//! (Ctrl+Shift+S) and a tray icon, and stops cleanly on Ctrl+C, the tray's Quit, or Windows
+//! logging off: Windows' default output given back, settings written, engine stopped.
+//! `--no-shell` leaves out the hotkey and the tray.
+//!
+//! While the PC's sound comes in through a cable, it makes the cable's input Windows' default
+//! output (Interface 1), and gives the user's back on exit, when the engine can't run, and
+//! after a crash (`defaults.rs`).
 //!
 //! It manages the soundboard driver's endpoint pool (Interface 2). `--fake-driver` stands in
 //! for the driver until it exists: a pool of 8 app endpoints and 2 virtual mics here, and the
@@ -69,6 +79,7 @@ fn main() {
     let (mut address, mut fake, mut log) = (transport::default_address(), false, false);
     let (mut engine, mut no_engine, mut fake_driver) = (None, false, false);
     let (mut config, mut no_config) = (None, false);
+    let (mut ui, mut no_ui, mut no_shell) = (None, false, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--address" => match args.next() {
@@ -88,6 +99,12 @@ fn main() {
             "--fake-driver" => fake_driver = true,
             "--fake-devices" => fake = true,
             "--log" => log = true,
+            "--ui" => match args.next() {
+                Some(v) => ui = Some(std::path::PathBuf::from(v)),
+                None => usage(),
+            },
+            "--no-ui" => no_ui = true,
+            "--no-shell" => no_shell = true,
             _ => usage(),
         }
     }
@@ -135,7 +152,17 @@ fn main() {
         },
         windows: !fake && cfg!(windows),
         driver: open_driver(fake_driver),
+        // Beside the settings: the marker that survives a crash while holding the default.
+        default_output: Some(
+            config
+                .as_deref()
+                .map(std::path::Path::to_path_buf)
+                .or_else(persist::default_path)
+                .map(|p| sb_controller::defaults::marker_path(&p)),
+        ),
         persist: save_to,
+        ui: if no_ui { None } else { ui_program(ui, &address) },
+        shell: cfg!(windows) && !no_shell,
     };
     let controller = Controller::launch(listener, state, opts);
     if fake {
@@ -144,9 +171,9 @@ fn main() {
         }
     }
     eprintln!("sb-controller {}: serving UIs on {address}", env!("CARGO_PKG_VERSION"));
-    // Runs until killed: a change less than 500 ms old isn't saved yet. A clean exit (and
-    // restoring Windows' defaults) arrives with M6.
+    stop_on_ctrl_c(&controller);
     controller.join();
+    eprintln!("sb-controller: stopped");
 }
 
 #[cfg(windows)]
@@ -198,10 +225,41 @@ fn open_driver(fake: bool) -> Option<sb_controller::OpenDriver> {
     None
 }
 
+/// The overlay to keep running: `--ui EXE`, or `sb-ui.exe` beside this program (Windows).
+fn ui_program(ui: Option<std::path::PathBuf>, address: &str) -> Option<(std::path::PathBuf, Vec<String>)> {
+    let exe = ui.or_else(|| {
+        let beside = std::env::current_exe().ok()?.with_file_name("sb-ui.exe");
+        (cfg!(windows) && beside.exists()).then_some(beside)
+    })?;
+    Some((exe, vec!["--address".into(), address.into()]))
+}
+
+/// Ctrl+C (or closing the console): stop cleanly, and hold the console's close until done.
+#[cfg(windows)]
+fn stop_on_ctrl_c(controller: &Controller) {
+    use std::sync::OnceLock;
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+    use windows::core::BOOL;
+    static STOP: OnceLock<(sb_controller::actor::Inbox, sb_controller::Stopped)> = OnceLock::new();
+    let _ = STOP.set((controller.inbox.clone(), controller.stopped()));
+    unsafe extern "system" fn handler(_event: u32) -> BOOL {
+        if let Some((inbox, stopped)) = STOP.get() {
+            eprintln!("sb-controller: stopping");
+            let _ = inbox.send(Msg::Stop);
+            stopped.wait(std::time::Duration::from_secs(5));
+        }
+        true.into()
+    }
+    let _ = unsafe { SetConsoleCtrlHandler(Some(handler), true) };
+}
+
+#[cfg(not(windows))]
+fn stop_on_ctrl_c(_controller: &Controller) {}
+
 fn usage() -> ! {
     eprintln!(
         "usage: sb-controller [--address ADDR] [--engine EXE | --no-engine] [--config FILE | --no-config] \
-         [--fake-driver] [--fake-devices] [--log]"
+         [--ui EXE | --no-ui] [--no-shell] [--fake-driver] [--fake-devices] [--log]"
     );
     std::process::exit(2);
 }

@@ -49,6 +49,7 @@ tools/vm/win-cargo.sh build --release -p sb-ui-spike --bins --examples   # U1: t
 tools/vm/win-cargo.sh build --release -p sb-ui -p sb-controller -p sb-engine-host --bins --examples   # U2: on sb-build's desktop, sb-controller.exe --fake-devices --fake-driver, then sb-ui.exe --log ui.log; Ctrl+Shift+S shows it (--show at startup)
 tools/vm/win-cargo.sh test -p sb-ui --test widgets   # U3: the widgets under synthetic input; on the desktop, sb-ui.exe --gallery --show shows them all without a controller. tools/vm/desktop.sh starts programs there, clicks, drags and takes screenshots
 tools/vm/win-cargo.sh build --release -p sb-ui -p sb-controller -p sb-engine-host --bins --examples   # U4: Simple mode (Interface 1) + pads: sb-controller.exe --fake-devices --fake-driver, sb-ui.exe; pick "PC sound from", toggle output cards, "Clips into mic + me", add sounds (dialog or drop)
+tools/vm/win-cargo.sh test -p sb-controller --test windows_defaults   # M6: Windows' default output moved and back (IPolicyConfig); examples\default_output.exe [DEVICE] reads or sets it. sb-controller.exe runs sb-ui.exe, owns Ctrl+Shift+S and a tray icon (Quit = clean exit); with "PC sound from" a VB-Cable it makes CABLE Input the default while the engine runs
 ```
 
 Other commands: `vm.sh status | start | stop | ssh <role> [cmd] | view <role> | seal | revert | password`.

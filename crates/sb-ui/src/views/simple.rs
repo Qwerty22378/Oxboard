@@ -36,6 +36,7 @@ fn note(ui: &mut egui::Ui, text: &str) {
 
 pub fn show(ui: &mut egui::Ui, store: &Store, v: &StateView, out: &mut Output) {
     source_and_master(ui, store, v, out);
+    default_output(ui, store, v, out);
 
     heading(ui, "OUTPUTS");
     let outputs: Vec<_> = v.devices.iter().filter(|(_, d)| d.flow == Flow::Render).collect();
@@ -119,6 +120,52 @@ pub fn show(ui: &mut egui::Ui, store: &Store, v: &StateView, out: &mut Output) {
 
     heading(ui, "SOUNDBOARD");
     clips_toggle(ui, store, v, out);
+}
+
+/// Interface 1 hears the PC through the cable, so the cable's input has to be Windows'
+/// default output; the controller makes it so while the engine runs (`defaults.rs`).
+fn default_output(ui: &mut egui::Ui, store: &Store, v: &StateView, out: &mut Output) {
+    let d = &v.default_output;
+    let Some(target) = &d.target else {
+        if v.system_input.is_some() {
+            ui.label(
+                RichText::new("The PC's sound doesn't come through a cable, so Windows' output is left alone")
+                    .size(11.0)
+                    .color(DIM),
+            );
+        }
+        return;
+    };
+    let name = v.devices.get(target).map_or(target.0.as_str(), |x| x.name.as_str());
+    ui.horizontal(|ui| {
+        let mut take = d.wanted;
+        let label = format!("Make {name} Windows' output");
+        if ui
+            .checkbox(&mut take, label)
+            .on_hover_text("So the PC's sound goes through the soundboard. Your own default is put back when the soundboard stops.")
+            .changed()
+        {
+            out.commands.push(Command::SetKeepWindowsDefault(!take));
+        }
+        if store.is_pending(|c| matches!(c, Command::SetKeepWindowsDefault(_))) {
+            ui.spinner();
+        }
+        let (text, color) = if let Some(p) = &d.problem {
+            (format!("couldn't change it: {p}"), Color32::from_rgb(235, 110, 95))
+        } else if d.owned {
+            ("on".to_string(), Color32::from_rgb(80, 200, 120))
+        } else if d.handed_back {
+            (
+                "given back while the audio engine is down".to_string(),
+                Color32::from_rgb(240, 180, 70),
+            )
+        } else if d.wanted {
+            ("switching…".to_string(), DIM)
+        } else {
+            ("off: the soundboard won't hear the PC".to_string(), DIM)
+        };
+        ui.label(RichText::new(text).size(11.0).color(color));
+    });
 }
 
 fn source_and_master(ui: &mut egui::Ui, store: &Store, v: &StateView, out: &mut Output) {

@@ -119,6 +119,11 @@ fn run(rx: Receiver<WinMsg>, wake: Sender<WinMsg>, inbox: Inbox) -> Result<()> {
                     }
                     sessions = true;
                 }
+                WinMsg::SetDefaults { op, defaults } => {
+                    let result = super::defaults::set(&w.en, &defaults);
+                    let _ = w.inbox.send(Msg::WinDone { op, result });
+                    devices = true;
+                }
                 WinMsg::Rescan {
                     devices: d,
                     sessions: s,
@@ -192,6 +197,7 @@ impl Watcher {
             }
         }
         new.sessions = self.sessions();
+        new.defaults = super::defaults::read(&self.en);
         if self.trace && new.sessions != self.world.sessions {
             for (id, s) in &new.sessions {
                 let tail = id.get(id.len().saturating_sub(12)..).unwrap_or(id);
@@ -521,6 +527,7 @@ impl IMMNotificationClient_Impl for DeviceEvents_Impl {
         Ok(())
     }
     fn OnDefaultDeviceChanged(&self, _: EDataFlow, _: ERole, _: &PCWSTR) -> Result<()> {
+        self.rescan();
         Ok(())
     }
     fn OnPropertyValueChanged(&self, _: &PCWSTR, key: &PROPERTYKEY) -> Result<()> {

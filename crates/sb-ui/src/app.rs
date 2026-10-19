@@ -47,6 +47,10 @@ impl Content for App {
         let mut changed = false;
         for ev in self.events.try_iter() {
             changed = true;
+            if ev == LinkEvent::Message(sb_shared::ui::UiMessage::ToggleOverlay) {
+                self.waker.toggle();
+                continue;
+            }
             if let LinkEvent::Connected { controller } | LinkEvent::Lost(controller) = &ev {
                 log::line(format!("link: {controller}"));
             }

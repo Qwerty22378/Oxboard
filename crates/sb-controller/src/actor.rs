@@ -24,6 +24,7 @@
 
 use crate::commands;
 use crate::compile::{Compiled, Continuity, Update, compile};
+use crate::defaults::Defaults;
 use crate::driver::DriverJob;
 use crate::engine_link::{EngineReport, LinkMsg};
 use crate::hub::{ClientId, Hub};
@@ -52,6 +53,8 @@ pub enum Msg {
     UiConnected {
         client: ClientId,
         name: String,
+        /// Its process (to let it take the foreground).
+        pid: u32,
     },
     Ui {
         client: ClientId,
@@ -77,6 +80,10 @@ pub enum Msg {
     },
     /// The persistence worker wrote the settings (or couldn't).
     Saved(Result<(), String>),
+    /// The overlay hotkey (or the tray icon): show or hide the overlay.
+    Hotkey,
+    /// A command from the controller itself (the tray menu); no reply.
+    Local(Command),
     /// Stop the actor (the controller is exiting).
     Stop,
 }
@@ -102,11 +109,15 @@ pub struct Actor {
     windows: Option<Sender<WinMsg>>,
     driver: Option<Sender<DriverJob>>,
     routing: Routing,
+    /// Windows' default output (Interface 1, M6).
+    defaults: Defaults,
     /// App levels as last sent to Windows.
     sent_levels: BTreeMap<AppKey, Level>,
     persist: Option<Sender<SaveMsg>>,
     /// Desired state as last sent to be saved.
     saved: Desired,
+    /// Connected UIs: what they call themselves, and their process.
+    uis: BTreeMap<ClientId, (String, u32)>,
 }
 
 /// What the engine has to be told, in order.
@@ -134,9 +145,11 @@ impl Actor {
             windows: None,
             driver: None,
             routing: Routing::default(),
+            defaults: Defaults::default(),
             sent_levels: BTreeMap::new(),
             persist: None,
             saved: Desired::default(),
+            uis: BTreeMap::new(),
         };
         a.recompile();
         a
@@ -160,6 +173,16 @@ impl Actor {
         self.routing.set_windows(win.clone());
         self.windows = Some(win);
         self.sync_windows();
+        self
+    }
+
+    /// Hold Windows' default output for Interface 1 (through the COM thread, so after
+    /// [`Actor::with_windows`]), remembering the user's in `marker` (see `crate::defaults`).
+    pub fn with_default_output(mut self, marker: Option<std::path::PathBuf>) -> Self {
+        if let Some(win) = &self.windows {
+            self.defaults = Defaults::new(win.clone(), marker);
+            self.publish();
+        }
         self
     }
 
@@ -201,11 +224,17 @@ impl Actor {
     /// state (for the clean-exit work: saving, restoring defaults).
     pub fn run(mut self, inbox: Receiver<Msg>) -> AppState {
         loop {
-            let msg = match self.next_retry() {
+            let wake = [self.next_retry(), self.defaults.next_deadline()]
+                .into_iter()
+                .flatten()
+                .min();
+            let msg = match wake {
                 Some(at) => match inbox.recv_timeout(at.saturating_duration_since(Instant::now())) {
                     Ok(m) => m,
                     Err(RecvTimeoutError::Timeout) => {
                         self.retry_due(Instant::now());
+                        // The default output's grace may be over.
+                        self.publish();
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -221,6 +250,7 @@ impl Actor {
             }
             self.handle(msg);
         }
+        self.give_back_defaults(&inbox);
         if let Some(w) = &self.windows {
             let _ = w.send(WinMsg::Stop);
         }
@@ -232,6 +262,45 @@ impl Actor {
             let _ = p.send(SaveMsg::Stop);
         }
         self.state
+    }
+
+    /// The overlay hotkey: every overlay may take the foreground (it didn't get the input, we
+    /// did), then is told to show or hide.
+    fn toggle_overlay(&mut self) {
+        let overlays: Vec<(ClientId, u32)> = self
+            .uis
+            .iter()
+            .filter(|(_, (name, _))| name == "overlay")
+            .map(|(c, (_, pid))| (*c, *pid))
+            .collect();
+        if overlays.is_empty() && self.log {
+            eprintln!("             hotkey, but no overlay is connected");
+        }
+        for (client, pid) in overlays {
+            #[cfg(windows)]
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(pid);
+            }
+            #[cfg(not(windows))]
+            let _ = pid;
+            self.hub.send(client, UiMessage::ToggleOverlay);
+        }
+    }
+
+    /// On the way out: hand Windows' default output back, and wait (a little) for it to be
+    /// done, so the PC isn't left playing into a cable nobody reads.
+    fn give_back_defaults(&mut self, inbox: &Receiver<Msg>) {
+        let Some(op) = self.defaults.give_back() else { return };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while let Ok(m) = inbox.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            if let Msg::WinDone { op: done, result } = m
+                && done == op
+            {
+                self.defaults.done(op, result);
+                return;
+            }
+        }
+        eprintln!("controller: Windows didn't confirm giving the default output back");
     }
 
     /// When the next failed device is due to be tried again.
@@ -259,7 +328,15 @@ impl Actor {
     pub fn handle(&mut self, msg: Msg) {
         self.trace(&msg);
         match msg {
-            Msg::UiConnected { .. } => {}
+            Msg::UiConnected { client, name, pid } => {
+                self.uis.insert(client, (name, pid));
+            }
+            Msg::Hotkey => self.toggle_overlay(),
+            Msg::Local(cmd) => {
+                if let Err(e) = self.command(cmd) {
+                    eprintln!("controller: {e}");
+                }
+            }
             Msg::Ui {
                 client,
                 req: UiRequest::Subscribe,
@@ -295,6 +372,7 @@ impl Actor {
                 }
             }
             Msg::UiDisconnected { client } => {
+                self.uis.remove(&client);
                 self.hub.remove(client);
             }
             Msg::Observed(o) => self.state.observe(o),
@@ -306,7 +384,10 @@ impl Actor {
                 }
             }
             Msg::WinDone { op, result } => {
-                if let Some(reply) = self.routing.win_done(&mut self.state, op, result) {
+                // The default output's jobs, else routing's.
+                if !self.defaults.done(op, result.clone())
+                    && let Some(reply) = self.routing.win_done(&mut self.state, op, result)
+                {
                     self.after_diff.push(reply);
                 }
             }
@@ -500,6 +581,8 @@ impl Actor {
         }
         self.sync_windows();
         self.routing.sync(&self.state);
+        self.defaults.sync(&self.state, Instant::now());
+        self.state.observed.default_output = self.defaults.status(&self.state);
         if let Some(p) = &self.persist
             && self.state.desired != self.saved
         {

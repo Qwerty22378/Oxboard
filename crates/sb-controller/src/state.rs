@@ -29,6 +29,10 @@ pub struct AppState {
 pub struct Desired {
     /// Where the PC's sound enters the mix.
     pub system_input: Option<SystemInput>,
+    /// Interface 1: leave Windows' default output alone. Normally (`false`) the controller makes
+    /// the device feeding the system input (the cable's input) the default while the engine
+    /// runs, so the PC's sound comes in; see [`crate::defaults`].
+    pub keep_windows_default: bool,
     /// Interface 1: every output the system input plays to.
     pub outputs: BTreeSet<DeviceKey>,
     pub master: Level,
@@ -87,6 +91,37 @@ pub struct Observed {
     pub failed: BTreeMap<DeviceKey, Failed>,
     /// Trouble reading or writing the settings file (C6).
     pub settings: SettingsView,
+    /// Windows' default render device per role (M6).
+    pub defaults: BTreeMap<Role, DeviceKey>,
+    /// Interface 1's hold on the default output, as `crate::defaults` reports it.
+    pub default_output: sb_shared::ui::DefaultOutputView,
+}
+
+/// Windows' default-device roles (`ERole`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Role {
+    /// Games, system sounds.
+    Console,
+    /// Music, video.
+    Multimedia,
+    /// Voice chat.
+    Communications,
+}
+
+impl Role {
+    pub const ALL: [Role; 3] = [Role::Console, Role::Multimedia, Role::Communications];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Console => "console",
+            Role::Multimedia => "multimedia",
+            Role::Communications => "communications",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.name() == s)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +186,8 @@ impl Default for Observed {
             loopbacks: BTreeMap::new(),
             failed: BTreeMap::new(),
             settings: SettingsView::default(),
+            defaults: BTreeMap::new(),
+            default_output: Default::default(),
         }
     }
 }
@@ -210,6 +247,8 @@ pub enum Observation {
     Driver(DriverStatus),
     /// Whether per-app routing works on this Windows.
     AppRouting(bool),
+    /// Windows' default render devices, by role (all of them, whenever one changes).
+    Defaults(BTreeMap<Role, DeviceKey>),
 }
 
 impl Desired {
@@ -258,6 +297,29 @@ impl AppState {
             .get(key)
             .map(|s| s.name.as_str())
             .or_else(|| self.desired.known_apps.get(key).map(String::as_str))
+    }
+
+    /// The way into a cable whose output is `capture`: where apps must play (the default output
+    /// takeover) and where "clips into the mic" go. A cable can have several (VB-Cable 4.5:
+    /// "CABLE Input" and "CABLE In 16ch"); the one named like "CABLE Input" is it, else the
+    /// first, so only one gets the sound.
+    pub fn feed_of(&self, capture: &DeviceKey) -> Option<DeviceKey> {
+        let feeds = self
+            .observed
+            .loopbacks
+            .iter()
+            .filter(|(_, l)| **l == Loopback::Capture(capture.clone()))
+            .map(|(render, _)| render);
+        let name = |k: &DeviceKey| self.device(k).map_or(String::new(), |d| d.name.to_lowercase());
+        let mut best: Option<&DeviceKey> = None;
+        for f in feeds {
+            if best.is_none()
+                || (name(f).contains("cable input") && !best.is_some_and(|b| name(b).contains("cable input")))
+            {
+                best = Some(f);
+            }
+        }
+        best.cloned()
     }
 
     /// Whether the graph can use the device: present, of that flow, and not failed.
@@ -332,6 +394,7 @@ impl AppState {
             }
             Observation::Driver(d) => self.observed.driver = d,
             Observation::AppRouting(ok) => self.observed.app_routing = Some(ok),
+            Observation::Defaults(d) => self.observed.defaults = d,
             Observation::Loopback { render, into } => {
                 match into {
                     Some(l) => self.observed.loopbacks.insert(render, l),

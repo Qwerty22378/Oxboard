@@ -14,18 +14,22 @@
 //! - [`engine_link`]: keeps an `sb-engine-host` running the current graph.
 //! - [`watch`] and `win` (Windows only): what Windows shows, scanned on a COM thread and
 //!   reported as observations; app levels set through session volumes.
+//! - [`defaults`]: Windows' default output handed to the cable while the engine runs, and
+//!   back whenever it can't deliver (M6).
 //! - [`driver`]: the driver's control plane (endpoint pool), on a worker; [`routing`]: apps
 //!   sent to outputs of their own through it.
 //! - [`persist`]: the settings file: desired state, loaded at startup, saved on change.
 //! - [`view`]: state → the `StateView` the UI is shown; the actor diffs consecutive views.
 //! - [`hub`], [`ui_server`], [`transport`]: connected UIs, their threads, and where they
-//!   connect.
+//!   connect; [`ui_launcher`]: the overlay process, kept running.
+//! - `win::shell` (Windows): the hotkey, the tray icon, and logoff/shutdown.
 //! - [`client`]: a UI's end of the link.
 
 pub mod actor;
 pub mod client;
 pub mod commands;
 pub mod compile;
+pub mod defaults;
 pub mod driver;
 pub mod engine_link;
 pub mod hub;
@@ -34,6 +38,7 @@ pub mod persist;
 pub mod routing;
 pub mod state;
 pub mod transport;
+pub mod ui_launcher;
 pub mod ui_server;
 pub mod view;
 pub mod watch;
@@ -57,6 +62,29 @@ pub struct Controller {
     windows: Option<std::thread::JoinHandle<()>>,
     driver: Option<std::thread::JoinHandle<()>>,
     persist: Option<std::thread::JoinHandle<()>>,
+    ui: Option<ui_launcher::UiLauncher>,
+    #[cfg(windows)]
+    shell: Option<win::shell::Shell>,
+    stopped: Stopped,
+}
+
+/// Set once the controller has stopped cleanly (defaults given back, settings written): what
+/// a logoff or a Ctrl+C waits for before letting the process end.
+#[derive(Clone, Default)]
+pub struct Stopped(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl Stopped {
+    pub fn set(&self) {
+        *self.0.0.lock().unwrap() = true;
+        self.0.1.notify_all();
+    }
+
+    /// Whether it stopped within `timeout`.
+    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+        let guard = self.0.0.lock().unwrap();
+        let (done, _) = self.0.1.wait_timeout_while(guard, timeout, |d| !*d).unwrap();
+        *done
+    }
 }
 
 /// Opens the driver's control interface (on the driver worker's thread).
@@ -73,6 +101,14 @@ pub struct Options {
     pub windows: bool,
     /// Manage the driver's endpoint pool (Interface 2).
     pub driver: Option<OpenDriver>,
+    /// Hold Windows' default output for Interface 1 (needs `windows`), remembering the user's
+    /// defaults in this marker file meanwhile (see [`defaults`]).
+    pub default_output: Option<Option<std::path::PathBuf>>,
+    /// Keep the overlay running: this program with these arguments ([`ui_launcher`]).
+    pub ui: Option<(std::path::PathBuf, Vec<String>)>,
+    /// Own the overlay hotkey and show the tray icon (Windows only; `win::shell`), and stop
+    /// cleanly when Windows logs off.
+    pub shell: bool,
     /// Save the settings here whenever they change (load them with [`persist::load`] first).
     pub persist: Option<(std::path::PathBuf, persist::Timing)>,
 }
@@ -120,6 +156,9 @@ impl Controller {
         let windows = if opts.windows {
             let (tx, thread) = win::com::spawn(inbox.clone());
             actor = actor.with_windows(tx);
+            if let Some(marker) = opts.default_output {
+                actor = actor.with_default_output(marker);
+            }
             Some(thread)
         } else {
             None
@@ -152,6 +191,12 @@ impl Controller {
             .spawn(move || actor.run(rx))
             .expect("spawn the actor");
         ui_server::spawn(listener, hub.clone(), inbox.clone());
+        let stopped = Stopped::default();
+        #[cfg(windows)]
+        let shell = opts
+            .shell
+            .then(|| win::shell::spawn(inbox.clone(), stopped.clone(), true, true));
+        let ui = opts.ui.map(|(exe, args)| ui_launcher::UiLauncher::spawn(exe, args));
         Self {
             inbox,
             hub,
@@ -160,6 +205,10 @@ impl Controller {
             windows,
             driver,
             persist,
+            ui,
+            #[cfg(windows)]
+            shell,
+            stopped,
         }
     }
 
@@ -177,7 +226,21 @@ impl Controller {
             let _ = tx.send(LinkMsg::Stop);
             let _ = thread.join();
         }
+        if let Some(ui) = self.ui {
+            ui.stop();
+        }
+        // Everything that matters is done: a logoff waiting on this may proceed.
+        self.stopped.set();
+        #[cfg(windows)]
+        if let Some(shell) = self.shell {
+            shell.stop();
+        }
         state
+    }
+
+    /// Set once [`Controller::join`] has finished the important part of stopping.
+    pub fn stopped(&self) -> Stopped {
+        self.stopped.clone()
     }
 
     /// Stop the actor and the engine, and return the final state. (The UI listener thread

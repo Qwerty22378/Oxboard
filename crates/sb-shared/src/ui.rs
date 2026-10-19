@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Bumped on any incompatible change to these types.
-pub const UI_PROTOCOL_VERSION: u32 = 3;
+pub const UI_PROTOCOL_VERSION: u32 = 4;
 /// Highest gain anything accepts: +6 dB, the top of the fader taper.
 pub const MAX_GAIN: f32 = 2.0;
 
@@ -197,6 +197,22 @@ pub struct ClipView {
     pub playing: bool,
 }
 
+/// Interface 1's hold on Windows' default output (the PC's sound has to play into the cable for
+/// the soundboard to hear it).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DefaultOutputView {
+    /// The user lets the soundboard take it, and there's a device to make the default.
+    pub wanted: bool,
+    /// Windows' default output is that device now (every role).
+    pub owned: bool,
+    /// The device that has to be the default: the system input's render side.
+    pub target: Option<DeviceKey>,
+    /// It was given back because the engine isn't running (the PC plays as usual meanwhile).
+    pub handed_back: bool,
+    /// Why the last attempt to change it failed.
+    pub problem: Option<String>,
+}
+
 /// Trouble with the settings file, for the UI to tell the user about.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SettingsView {
@@ -228,6 +244,7 @@ pub struct StateView {
     pub master: Level,
     pub engine: EngineStatus,
     pub settings: SettingsView,
+    pub default_output: DefaultOutputView,
 }
 
 impl Default for StateView {
@@ -242,6 +259,7 @@ impl Default for StateView {
             master: Level::UNITY,
             engine: EngineStatus::Down,
             settings: SettingsView::default(),
+            default_output: DefaultOutputView::default(),
         }
     }
 }
@@ -258,6 +276,7 @@ pub enum DiffOp {
     Master(Level),
     Engine(EngineStatus),
     Settings(SettingsView),
+    DefaultOutput(DefaultOutputView),
 }
 
 /// The ops that turn `old` into `new` (empty when they're equal).
@@ -284,6 +303,9 @@ pub fn diff(old: &StateView, new: &StateView) -> Vec<DiffOp> {
     }
     if old.settings != new.settings {
         ops.push(DiffOp::Settings(new.settings.clone()));
+    }
+    if old.default_output != new.default_output {
+        ops.push(DiffOp::DefaultOutput(new.default_output.clone()));
     }
     ops
 }
@@ -330,6 +352,7 @@ impl StateView {
                 DiffOp::Master(l) => self.master = l,
                 DiffOp::Engine(e) => self.engine = e,
                 DiffOp::Settings(s) => self.settings = s,
+                DiffOp::DefaultOutput(d) => self.default_output = d,
             }
         }
     }
@@ -390,6 +413,9 @@ pub enum Command {
     RestartEngine,
     /// The user has seen `SettingsView::load_error`.
     DismissLoadError,
+    /// Leave Windows' default output alone (`true`: "Restore Windows audio"), or let the
+    /// soundboard make the cable the default while it runs (`false`).
+    SetKeepWindowsDefault(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -397,6 +423,9 @@ pub struct UiHello {
     pub protocol: u32,
     /// Who's connecting, for logs.
     pub client: String,
+    /// Its process, so the controller can let it take the foreground when it shows the
+    /// overlay (`AllowSetForegroundWindow`).
+    pub pid: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -468,6 +497,9 @@ pub enum UiMessage {
     /// Throttled (~30 Hz) and separate from diffs, so meters never delay state. Only what's
     /// in the running graph is metered.
     Meters(Vec<(MeterTarget, MeterLevels)>),
+    /// The overlay hotkey was pressed: show the overlay if it's hidden, hide it if it's shown.
+    /// The controller has already let the UI take the foreground.
+    ToggleOverlay,
 }
 
 /// What [`Mirror::apply`] did with a message.
@@ -761,6 +793,7 @@ mod tests {
         round_trip(&UiHello {
             protocol: UI_PROTOCOL_VERSION,
             client: "overlay".into(),
+            pid: 4242,
         });
         let settings = ClipSettings {
             name: "Airhorn".into(),
