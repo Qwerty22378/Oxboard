@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Bumped on any incompatible change to these types.
-pub const UI_PROTOCOL_VERSION: u32 = 2;
+pub const UI_PROTOCOL_VERSION: u32 = 3;
 /// Highest gain anything accepts: +6 dB, the top of the fader taper.
 pub const MAX_GAIN: f32 = 2.0;
 
@@ -149,6 +149,9 @@ pub struct DeviceView {
     /// Windows lists it but the engine couldn't keep it open; it's out of the mix and being
     /// retried.
     pub failed: bool,
+    /// What's played into it comes back as a microphone (VB-Cable's "CABLE Input"; later the
+    /// driver's virtual mics): where "clips → mic" goes. Render devices only.
+    pub mic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -566,6 +569,7 @@ mod tests {
                             selected: flow == Flow::Render && r.below(2) == 0,
                             loops: r.below(5) == 0,
                             failed: r.below(7) == 0,
+                            mic: r.below(4) == 0,
                         },
                     );
                 }

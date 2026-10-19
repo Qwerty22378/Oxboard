@@ -1,0 +1,34 @@
+[package]
+name = "sb-ui-spike"
+version = "0.1.0"
+description = "U1: throwaway overlay spike. A hotkey toggles a transparent topmost egui panel over a game; measures what the shell and renderer decisions need"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true   # eframe/egui 0.36 need 1.95, but they only build on Windows; elsewhere the binary is a stub
+publish = false
+
+# Windows only: an overlay over Windows games. Elsewhere nothing below is built.
+[target.'cfg(windows)'.dependencies]
+egui = "0.36.2"
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
+raw-window-handle = "0.6"   # the eframe window's HWND
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",          # fake_game: the "game" renders with D3D11
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dwm",               # DwmFlush: when a layered window's frame is on screen
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",               # DIB sections, monitors
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",       # working set
+    "Win32_System_Threading",           # named events, process times
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",  # RegisterHotKey, SetCapture
+    "Win32_UI_Shell",                   # SHQueryUserNotificationState
+    "Win32_UI_WindowsAndMessaging",
+]

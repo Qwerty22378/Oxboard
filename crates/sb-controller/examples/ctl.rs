@@ -263,13 +263,14 @@ fn show(v: &StateView) {
     println!("devices:");
     for d in v.devices.values() {
         println!(
-            "  {} {:<24} {:?}{}{}{}",
+            "  {} {:<24} {:?}{}{}{}{}",
             if d.selected { "[x]" } else { "[ ]" },
             d.name,
             d.flow,
             if d.present { "" } else { "  (not connected)" },
             if d.loops { "  (would loop)" } else { "" },
-            if d.failed { "  (won't open, retrying)" } else { "" }
+            if d.failed { "  (won't open, retrying)" } else { "" },
+            if d.mic { "  (feeds a mic)" } else { "" }
         );
     }
     println!("apps:");

@@ -1,0 +1,31 @@
+[package]
+name = "sb-ui"
+version = "0.1.0"
+description = "The soundboard's overlay: a pure view of the controller's state, shown over games on a hotkey"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true   # egui 0.36 needs 1.95, but only builds on Windows (see below)
+
+[dependencies]
+sb-controller.workspace = true   # transport: where the controller listens, and how to connect
+sb-shared.workspace = true
+
+# The window, egui and the renderer are Windows only (an overlay over Windows games). The store
+# and the link build and test everywhere.
+[target.'cfg(windows)'.dependencies]
+egui = "0.36.2"
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",               # DwmFlush: the first frame is on screen
+    "Win32_Graphics_Gdi",               # DIB sections, monitors
+    "Win32_System_Com",                 # the file dialog
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",  # RegisterHotKey, SetCapture
+    "Win32_UI_Shell",                   # the file dialog, dropped files
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+]

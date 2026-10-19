@@ -45,6 +45,10 @@ tools/vm/win-cargo.sh build --release -p sb-controller -p sb-engine-host --bins 
 tools/vm/win-cargo.sh test -p sb-controller --test windows_watch   # C4: the real COM thread (devices, this test as an app, levels both ways); sb-controller.exe --log now shows the real devices and apps
 tools/vm/win-cargo.sh test -p sb-controller --test windows_policy   # C5: a child process sent to the non-default output (per-app outputs); examples\app_output.exe PID [DEVICE|default]; sb-controller.exe --fake-driver, then ctl send APP OUTPUT
 tools/vm/win-cargo.sh test -p sb-controller --test ui_link   # C6: settings outlive the controller; sb-controller.exe saves to %APPDATA%\Soundboard\config.toml (--config FILE, --no-config), ctl dismiss clears a load error
+tools/vm/win-cargo.sh build --release -p sb-ui-spike --bins --examples   # U1: then, with dev logged in on the console, tools/vm/overlay-spike.sh TAG "--shell win32|eframe ..." "--mode windowed|borderless|exclusive --capture" (see the script)
+tools/vm/win-cargo.sh build --release -p sb-ui -p sb-controller -p sb-engine-host --bins --examples   # U2: on sb-build's desktop, sb-controller.exe --fake-devices --fake-driver, then sb-ui.exe --log ui.log; Ctrl+Shift+S shows it (--show at startup)
+tools/vm/win-cargo.sh test -p sb-ui --test widgets   # U3: the widgets under synthetic input; on the desktop, sb-ui.exe --gallery --show shows them all without a controller. tools/vm/desktop.sh starts programs there, clicks, drags and takes screenshots
+tools/vm/win-cargo.sh build --release -p sb-ui -p sb-controller -p sb-engine-host --bins --examples   # U4: Simple mode (Interface 1) + pads: sb-controller.exe --fake-devices --fake-driver, sb-ui.exe; pick "PC sound from", toggle output cards, "Clips into mic + me", add sounds (dialog or drop)
 ```
 
 Other commands: `vm.sh status | start | stop | ssh <role> [cmd] | view <role> | seal | revert | password`.

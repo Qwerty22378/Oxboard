@@ -58,6 +58,14 @@ impl Hub {
         }
     }
 
+    /// Forget every UI and close their connections (the controller is stopping).
+    pub fn close_all(&self) {
+        let clients = std::mem::take(&mut *self.lock());
+        for c in clients.into_values() {
+            (c.close)();
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.lock().len()
     }

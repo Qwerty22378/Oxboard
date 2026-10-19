@@ -168,6 +168,8 @@ impl Controller {
         // The actor stops the COM thread, the driver worker and the persistence worker (after
         // its last save) on its way out.
         let state = self.actor.join().expect("the actor panicked");
+        // UIs see the controller go (a process exit would do the same).
+        self.hub.close_all();
         for thread in [self.windows, self.driver, self.persist].into_iter().flatten() {
             let _ = thread.join();
         }

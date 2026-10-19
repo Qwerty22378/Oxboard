@@ -31,6 +31,8 @@ pub fn project(state: &AppState) -> StateView {
                 selected: info.flow == Flow::Render && d.outputs.contains(key),
                 loops: false,
                 failed: o.failed.get(key).is_some_and(|f| f.retry_at.is_some()),
+                mic: info.flow == Flow::Render
+                    && matches!(o.loopbacks.get(key), Some(crate::state::Loopback::Capture(_))),
             },
         );
     }
@@ -89,4 +91,35 @@ pub fn project(state: &AppState) -> StateView {
     }
     view.would_loop = w.cells;
     view
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{DeviceInfo, Loopback, Observation};
+    use sb_shared::ui::DeviceKey;
+
+    #[test]
+    fn a_cable_input_feeds_a_mic_and_speakers_dont() {
+        let mut s = AppState::default();
+        let dev = |id: &str, flow| Observation::DeviceAdded {
+            key: DeviceKey(id.into()),
+            info: DeviceInfo { name: id.into(), flow },
+        };
+        for o in [
+            dev("cable-in", Flow::Render),
+            dev("cable-out", Flow::Capture),
+            dev("speakers", Flow::Render),
+            Observation::Loopback {
+                render: DeviceKey("cable-in".into()),
+                into: Some(Loopback::Capture(DeviceKey("cable-out".into()))),
+            },
+        ] {
+            s.observe(o);
+        }
+        let v = project(&s);
+        let mic = |k: &str| v.devices[&DeviceKey(k.into())].mic;
+        assert!(mic("cable-in"));
+        assert!(!mic("speakers") && !mic("cable-out"));
+    }
 }
