@@ -25,6 +25,10 @@ pub struct StreamStats {
     pub max_chunk: AtomicU32,
     /// Mix side of a device ring: the drift correction in ppm (f32 bits).
     pub drift_ppm: AtomicU32,
+    /// Mix side of a device ring: the fill the drift controller measured last (with the
+    /// device's frames since its last packet), and its low-passed value (f32 bits).
+    pub measured_fill: AtomicU32,
+    pub filtered_fill: AtomicU32,
     /// Whether the thread got its MMCSS "Pro Audio" registration.
     pub mmcss: AtomicBool,
 }
@@ -40,6 +44,8 @@ pub struct StatsSnapshot {
     pub ring_fill: u32,
     pub max_chunk: u32,
     pub drift_ppm: f32,
+    pub measured_fill: u32,
+    pub filtered_fill: f32,
     pub mmcss: bool,
 }
 
@@ -54,6 +60,8 @@ impl StreamStats {
             ring_fill: self.ring_fill.load(Relaxed),
             max_chunk: self.max_chunk.load(Relaxed),
             drift_ppm: f32::from_bits(self.drift_ppm.load(Relaxed)),
+            measured_fill: self.measured_fill.load(Relaxed),
+            filtered_fill: f32::from_bits(self.filtered_fill.load(Relaxed)),
             mmcss: self.mmcss.load(Relaxed),
         }
     }

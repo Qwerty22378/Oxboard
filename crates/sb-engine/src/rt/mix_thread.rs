@@ -52,12 +52,19 @@ pub fn render_block(plan: &mut RenderPlan, now: u64) -> [&[f32]; 2] {
                         drift: Some(d),
                     }) => {
                         let need = d.input_needed().min(frames.len());
+                        reader.hold_growth(d.settling(now));
                         reader.read(&mut frames[..need], stats);
+                        // An underrun may have deepened the ring's target.
+                        d.retarget(reader.target());
                         d.pull(&frames[..need], l, r);
                         if let Some(fill) = reader.estimated_fill(now) {
                             d.measure(fill, now);
+                            stats.measured_fill.store(fill as u32, Relaxed);
                         }
                         stats.drift_ppm.store((d.ppm() as f32).to_bits(), Relaxed);
+                        if let Some(f) = d.filtered_fill() {
+                            stats.filtered_fill.store((f as f32).to_bits(), Relaxed);
+                        }
                     }
                     Some(Input {
                         reader,

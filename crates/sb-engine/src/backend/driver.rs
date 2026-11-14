@@ -353,7 +353,7 @@ impl<L: DriverLink> VirtualEndpoints<L> {
     /// Attach `endpoint` for apps → engine; returns the engine ring's reading end.
     pub fn open_source(&mut self, node: NodeId, endpoint: u32) -> Result<(RingReader, EndpointKey), String> {
         let Attached { ring, wake, period } = self.attach(endpoint, Direction::FromApps)?;
-        let (writer, reader) = RingSizing::for_bursts(period, self.mix_burst).ring();
+        let (writer, reader) = RingSizing::for_bursts(period, self.mix_burst).input_ring();
         let stats = Arc::new(StreamStats::default());
         let pump = Pump::Source(SourcePump::new(&ring, writer, stats.clone()));
         let thread = PumpThread::spawn(pump, wake, stats.clone()).inspect_err(|_| self.link.detach(endpoint))?;

@@ -21,6 +21,33 @@ use std::f64::consts::TAU;
 struct DeviceSpec {
     period: usize,
     ppm: f64,
+    /// Capture only: replay real packet arrivals (µs since the first, frames) instead of
+    /// ticking evenly, looping at the end. `ppm` is then ignored.
+    trace: Option<&'static [(u64, usize)]>,
+}
+
+/// A packet trace recorded with `examples/capture_probe.rs --trace` (`µs,frames` lines).
+fn parse_trace(text: &str) -> Vec<(u64, usize)> {
+    text.lines()
+        .filter_map(|l| {
+            let (t, n) = l.split_once(',')?;
+            Some((t.trim().parse().ok()?, n.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// VB-Cable's "CABLE Output" on `sb-build` with a sound playing into "CABLE Input": 60 s of
+/// 480-frame packets, 4.5–16 ms apart, −4 ppm on average (M6 drift report).
+fn vbcable_trace() -> &'static [(u64, usize)] {
+    static TRACE: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
+    TRACE.get_or_init(|| parse_trace(include_str!("../testdata/vbcable-playing.csv")))
+}
+
+/// The same, with every core of the VM kept busy (as a game would): VB-Cable then hands over
+/// two packets at a time about every 19 ms, up to 12 ms late, +152 ppm.
+fn vbcable_loaded_trace() -> &'static [(u64, usize)] {
+    static TRACE: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
+    TRACE.get_or_init(|| parse_trace(include_str!("../testdata/vbcable-loaded.csv")))
 }
 
 enum DeviceEnd {
@@ -50,6 +77,9 @@ struct SimDevice {
     end: DeviceEnd,
     next_ns: f64,
     stats: std::sync::Arc<StreamStats>,
+    /// Trace replay: the next packet, and where the current pass of the trace started (ns).
+    trace_at: usize,
+    trace_base: f64,
 }
 
 struct SimEndpoints {
@@ -65,13 +95,15 @@ struct SimEndpoints {
 impl Endpoints for SimEndpoints {
     fn input(&mut self, _: NodeId, device: &str) -> Result<(RingReader, EndpointKey), String> {
         let spec = self.devices[device];
-        let (writer, reader) = RingSizing::for_bursts(spec.period, self.mix_burst).ring();
+        let (writer, reader) = RingSizing::for_bursts(spec.period, self.mix_burst).input_ring();
         self.next_key += 1;
         let dev = SimDevice {
             spec,
             end: DeviceEnd::Capture { writer, phase: 0.0 },
             next_ns: 0.0,
             stats: Default::default(),
+            trace_at: 0,
+            trace_base: 0.0,
         };
         self.open.push((self.next_key, device.into(), dev));
         Ok((reader, self.next_key))
@@ -89,6 +121,8 @@ impl Endpoints for SimEndpoints {
             },
             next_ns: 0.0,
             stats: Default::default(),
+            trace_at: 0,
+            trace_base: 0.0,
         };
         self.open.push((self.next_key, device.into(), dev));
         Ok((writer, self.next_key))
@@ -107,7 +141,7 @@ impl Endpoints for SimEndpoints {
             tone_hz: self.tone_hz,
         };
         let ticker = FakeTicker::new(cfg, ring.clone(), Default::default())?;
-        let (writer, reader) = RingSizing::for_bursts(spec.period, self.mix_burst).ring();
+        let (writer, reader) = RingSizing::for_bursts(spec.period, self.mix_burst).input_ring();
         let stats = std::sync::Arc::new(StreamStats::default());
         let pump = SourcePump::new(&ring, writer, stats.clone());
         self.next_key += 1;
@@ -116,6 +150,8 @@ impl Endpoints for SimEndpoints {
             end: DeviceEnd::VirtualSource { ticker, pump },
             next_ns: 0.0,
             stats,
+            trace_at: 0,
+            trace_base: 0.0,
         };
         self.open.push((self.next_key, format!("v{endpoint}"), dev));
         Ok((reader, self.next_key))
@@ -148,6 +184,8 @@ impl Endpoints for SimEndpoints {
             end,
             next_ns: 0.0,
             stats,
+            trace_at: 0,
+            trace_base: 0.0,
         };
         self.open.push((self.next_key, format!("v{endpoint}"), dev));
         Ok((writer, self.next_key))
@@ -188,7 +226,16 @@ impl Sim {
     fn new(block: usize, devices: &[(&str, usize, f64)], master: &str, tone_hz: f64) -> Self {
         let devices: HashMap<String, DeviceSpec> = devices
             .iter()
-            .map(|&(n, period, ppm)| (n.to_string(), DeviceSpec { period, ppm }))
+            .map(|&(n, period, ppm)| {
+                (
+                    n.to_string(),
+                    DeviceSpec {
+                        period,
+                        ppm,
+                        trace: None,
+                    },
+                )
+            })
             .collect();
         let master_period = devices[master].period;
         let endpoints = SimEndpoints {
@@ -273,7 +320,10 @@ impl Sim {
             let ep = self.engine.endpoints_mut();
             let tone = ep.tone_hz;
             let d = &mut ep.open[i].2;
-            let n = d.spec.period;
+            let n = match d.spec.trace {
+                Some(t) => t[d.trace_at].1,
+                None => d.spec.period,
+            };
             match &mut d.end {
                 DeviceEnd::Capture { writer, phase } => {
                     let frames: Vec<Frame> = (0..n)
@@ -304,7 +354,25 @@ impl Sim {
                     pump.step((at + jitter) as u64);
                 }
             }
-            d.next_ns += n as f64 / (48_000.0 * (1.0 + d.spec.ppm * 1e-6)) * 1e9;
+            match d.spec.trace {
+                Some(t) => {
+                    d.trace_at += 1;
+                    if d.trace_at == t.len() {
+                        // Loop, skipping the first second (stream start-up): the next pass
+                        // picks up 10 ms (one period) after the last packet.
+                        let restart = t.iter().position(|p| p.0 >= 1_000_000).unwrap_or(0);
+                        // The trace's own rhythm across the seam: its median gap between
+                        // wake-ups that brought data.
+                        let mut gaps: Vec<u64> = t.windows(2).map(|w| w[1].0 - w[0].0).filter(|g| *g > 0).collect();
+                        gaps.sort_unstable();
+                        let gap = gaps.get(gaps.len() / 2).copied().unwrap_or(10_000);
+                        d.trace_base += (t[t.len() - 1].0 - t[restart].0 + gap) as f64 * 1e3;
+                        d.trace_at = restart;
+                    }
+                    d.next_ns = d.trace_base + t[d.trace_at].0 as f64 * 1e3;
+                }
+                None => d.next_ns += n as f64 / (48_000.0 * (1.0 + d.spec.ppm * 1e-6)) * 1e9,
+            }
         }
         self.clock.now = end_ns as u64;
         self.next_master = Some(next_master);
@@ -564,4 +632,83 @@ fn virtual_endpoints_drift_correct_and_run_clean() {
             "apps hear it"
         );
     }
+}
+
+/// The M6 drift report: Interface 1 with VB-Cable as the system input pinned the input ring's
+/// controller at +2000 ppm and ran it dry every few seconds, though VB-Cable keeps time to a
+/// few ppm. Replays VB-Cable's real packet arrivals into a 10 ms master.
+#[test]
+fn vbcable_capture_settles_without_underruns() {
+    vbcable_settles(vbcable_trace(), 0.0);
+}
+
+#[test]
+fn vbcable_capture_under_load_settles_without_underruns() {
+    vbcable_settles(vbcable_loaded_trace(), 152.0);
+}
+
+#[test]
+#[ignore]
+fn experiment_bigger_target() {
+    let mut sim = Sim::new(256, &[("spk", 480, 0.0), ("cable", 1920, 0.0)], "spk", 1000.0);
+    sim.engine.endpoints_mut().devices.get_mut("cable").unwrap().trace = Some(vbcable_loaded_trace());
+    let spec = GraphSpec {
+        nodes: vec![input(1, "cable"), crate::testing::bus(2), output(3, "spk")],
+        edges: vec![edge(1, 2), edge(2, 3)],
+        master: Some(NodeId(3)),
+        ..Default::default()
+    };
+    sim.engine.apply_graph(&spec).unwrap();
+    for s in 0..12 {
+        sim.run(10.0);
+        let r = sim.ring_stats(1);
+        println!(
+            "{}s {:+.0}ppm measured {} filtered {:.0} xr {}",
+            (s + 1) * 10,
+            r.drift_ppm,
+            r.measured_fill,
+            r.filtered_fill,
+            r.xruns
+        );
+    }
+}
+
+/// Replay `trace` as the system input into a 10 ms master; after 40 s the correction must
+/// stay near the trace's real drift (`ppm`; bursty delivery makes it wander a few hundred
+/// ppm, under half a cent) with no dropouts.
+fn vbcable_settles(trace: &'static [(u64, usize)], ppm: f64) {
+    let mut sim = Sim::new(256, &[("spk", 480, 0.0), ("cable", 480, 0.0)], "spk", 1000.0);
+    sim.engine.endpoints_mut().devices.get_mut("cable").unwrap().trace = Some(trace);
+    let spec = GraphSpec {
+        nodes: vec![input(1, "cable"), crate::testing::bus(2), output(3, "spk")],
+        edges: vec![edge(1, 2), edge(2, 3)],
+        master: Some(NodeId(3)),
+        ..Default::default()
+    };
+    sim.engine.apply_graph(&spec).unwrap();
+    let mut worst = 0.0f64;
+    let mut series = Vec::new();
+    sim.run(40.0);
+    let settled = sim.ring_stats(1);
+    for s in 0..80 {
+        sim.run(1.0);
+        let r = sim.ring_stats(1);
+        worst = worst.max((r.drift_ppm as f64 - ppm).abs());
+        if s % 10 == 0 {
+            series.push(format!(
+                "{}s {:+.0}ppm fill {} xr {}",
+                40 + s,
+                r.drift_ppm,
+                r.measured_fill,
+                r.xruns
+            ));
+        }
+    }
+    let end = sim.ring_stats(1);
+    println!("{}", series.join("\n"));
+    assert_eq!(end.xruns, settled.xruns, "ran dry after settling: {series:#?}");
+    assert!(
+        worst < 400.0,
+        "correction strayed {worst:.0} ppm from {ppm}: {series:#?}"
+    );
 }

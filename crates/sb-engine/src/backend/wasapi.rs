@@ -320,7 +320,7 @@ impl WasapiEndpoints {
 impl Endpoints for WasapiEndpoints {
     fn input(&mut self, node: NodeId, device: &str) -> std::result::Result<(RingReader, EndpointKey), String> {
         let mut open = || -> Result<(RingReader, EndpointKey)> {
-            let (writer, reader) = RingSizing::for_bursts(default_period_frames(device)?, self.mix_burst).ring();
+            let (writer, reader) = RingSizing::for_bursts(default_period_frames(device)?, self.mix_burst).input_ring();
             let stream = spawn_capture(device, writer)?;
             Ok((reader, self.add(node, stream)))
         };

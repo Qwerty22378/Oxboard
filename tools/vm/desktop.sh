@@ -14,6 +14,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 # Start EXE ARGS in dev's desktop session: a one-shot scheduled task (SSH has no desktop).
 desk() {
   local name=$1 exe=$2 args=$3 dir=${4:-C:\\src} level=${5:-Limited}
+  args=${args//\'/\'\'}   # inside a PowerShell '...' string
   vm_ps sb-build "
     \$a = New-ScheduledTaskAction -Execute '$exe' -Argument '$args' -WorkingDirectory '$dir'
     \$p = New-ScheduledTaskPrincipal -UserId $WIN_USER -LogonType Interactive -RunLevel $level

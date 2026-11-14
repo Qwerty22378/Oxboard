@@ -127,21 +127,23 @@ impl Defaults {
         let current = &state.observed.defaults;
         match (self.wanted(state, now), &self.previous) {
             (Some(t), _) => {
-                if Role::ALL.iter().all(|r| current.get(r) == Some(&t)) {
-                    return;
-                }
-                if self.previous.is_some() && self.last_take.is_some_and(|at| now.duration_since(at) < REASSERT_EVERY) {
-                    return;
-                }
                 if self.previous.is_none() {
-                    // Remember the user's before touching anything, on disk first.
-                    let previous: DefaultsMap = current.clone();
+                    // Remember the user's before touching anything, on disk first. Even when
+                    // the cable is the default already (VB-Cable's installer does that):
+                    // there's still a real output to give back when the soundboard stops.
+                    let previous = user_defaults(state, current, &t);
                     if let Some(path) = &self.marker
                         && let Err(e) = write_marker(path, &previous)
                     {
                         eprintln!("controller: can't write {}: {e}", path.display());
                     }
                     self.previous = Some(previous);
+                }
+                if Role::ALL.iter().all(|r| current.get(r) == Some(&t)) {
+                    return;
+                }
+                if self.last_take.is_some_and(|at| now.duration_since(at) < REASSERT_EVERY) {
+                    return;
                 }
                 self.last_take = Some(now);
                 self.op(Goal::Take, Role::ALL.iter().map(|r| (*r, t.clone())).collect());
@@ -218,6 +220,35 @@ impl Defaults {
             problem: self.problem.clone(),
         }
     }
+}
+
+/// The defaults to give back later: Windows' current ones, except that a role already on the
+/// cable (`target`) gets a real output instead. Installing VB-Cable makes "CABLE Input" the
+/// default, so "giving back" that would leave the PC playing into a cable nobody reads once
+/// the soundboard stops. A real output: the first one the soundboard plays to, else any
+/// present output that isn't a cable's way in.
+fn user_defaults(state: &AppState, current: &DefaultsMap, target: &DeviceKey) -> DefaultsMap {
+    let o = &state.observed;
+    let speaker = |k: &DeviceKey| {
+        k != target
+            && o.devices.get(k).is_some_and(|d| d.flow == sb_shared::ui::Flow::Render)
+            && !o.loopbacks.contains_key(k)
+    };
+    let fallback = state
+        .desired
+        .outputs
+        .iter()
+        .find(|k| speaker(k))
+        .or_else(|| o.devices.keys().find(|k| speaker(k)))
+        .cloned();
+    current
+        .iter()
+        .map(|(role, device)| match &fallback {
+            Some(f) if device == target => (*role, f.clone()),
+            // Not the cable, or no real output at all: give back what was there.
+            _ => (*role, device.clone()),
+        })
+        .collect()
 }
 
 // --- The marker -----------------------------------------------------------------------------
@@ -347,6 +378,28 @@ mod tests {
         d.sync(&s, t0 + Duration::from_secs(6));
         assert_eq!(answer(&mut s, &mut d, &rx, Ok(())), all("cable-in"));
         let _ = std::fs::remove_dir_all(marker.parent().unwrap());
+    }
+
+    #[test]
+    fn a_cable_that_was_already_the_default_is_not_given_back() {
+        // VB-Cable's installer made its input the default; the user listens on the speakers.
+        let (mut s, mut d, rx) = rig(None);
+        s.observe(Observation::Defaults(all("cable-in")));
+        s.desired.outputs.insert(k("speakers"));
+        running(&mut s);
+        d.sync(&s, Instant::now());
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing to switch: the cable is the default already"
+        );
+        assert!(d.holding(), "but there's a real output to give back later");
+        s.desired.keep_windows_default = true;
+        d.sync(&s, Instant::now());
+        assert_eq!(
+            answer(&mut s, &mut d, &rx, Ok(())),
+            all("speakers"),
+            "the speakers, not the cable nobody reads"
+        );
     }
 
     #[test]

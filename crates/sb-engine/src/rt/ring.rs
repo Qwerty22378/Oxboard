@@ -6,6 +6,11 @@
 //!   `target` frames, so one late capture packet doesn't cause a run of tiny underruns.
 //! - **Trimming:** if the fill climbs past `max`, skip frames back down to `target`. A safety
 //!   net only: the drift resamplers (`clock::drift`) keep the fill near the target.
+//! - **Growing (input rings):** a device's reported period isn't always how it delivers. Under
+//!   load VB-Cable hands over two 10 ms packets at once, every ~20 ms and up to 12 ms late, so
+//!   a target sized for 10 ms bursts runs dry every few seconds (the M6 drift report). An
+//!   adaptive reader raises its target by [`GROW_STEP_MS`] at each underrun, up to
+//!   [`GROW_LIMIT_MS`] above where it started: a little more latency instead of dropouts.
 //!
 //! **Stamps (E6):** the device thread on each ring records its running frame count and the
 //! time ([`RingWriter::stamp`] / [`RingReader::stamp`]). The mix side uses them to estimate
@@ -107,6 +112,13 @@ impl RingSizing {
         }
     }
 
+    /// An input ring (capture device → mix): its reader deepens its target when the device
+    /// turns out burstier than its period says.
+    pub fn input_ring(self) -> (RingWriter, RingReader) {
+        let (w, r) = self.ring();
+        (w, r.adaptive())
+    }
+
     /// A ring of this size, with a reader using these levels. Both ends know the target, so
     /// whichever end the mix holds can steer toward it.
     pub fn ring(self) -> (RingWriter, RingReader) {
@@ -190,11 +202,22 @@ impl RingWriter {
     }
 }
 
+/// How much an adaptive reader raises its target per underrun.
+pub const GROW_STEP_MS: f64 = 10.0;
+/// How far above its starting target an adaptive reader may go.
+pub const GROW_LIMIT_MS: f64 = 80.0;
+/// `max` sits this far above the target.
+const TRIM_HEADROOM_MS: f64 = 30.0;
+
 /// Consumer side: used by a render thread.
 pub struct RingReader {
     consumer: Consumer<Frame>,
     target: usize,
     max: usize,
+    /// Adaptive (input rings): the highest the target may grow to; `None`: fixed.
+    grow_limit: Option<usize>,
+    /// Growth is held off (the mix just stalled: that underrun is lost time, not burstiness).
+    hold_growth: bool,
     primed: bool,
     /// Frames taken out so far (read or trimmed).
     total: u64,
@@ -212,10 +235,21 @@ impl RingReader {
             consumer,
             target,
             max,
+            grow_limit: None,
+            hold_growth: false,
             primed: false,
             total: 0,
             stamps: Arc::default(),
         }
+    }
+
+    /// Raise the target at each underrun (see the module notes), as far as the ring's room
+    /// above `max` allows.
+    pub fn adaptive(mut self) -> Self {
+        let limit = self.target + crate::ms_to_frames(GROW_LIMIT_MS);
+        let room = self.consumer.buffer().capacity() - crate::ms_to_frames(TRIM_HEADROOM_MS);
+        self.grow_limit = Some(limit.min(room).max(self.target));
+        self
     }
 
     /// Share stamps with the writer of the same ring.
@@ -226,6 +260,13 @@ impl RingReader {
 
     pub fn fill(&self) -> usize {
         self.consumer.slots()
+    }
+
+    /// Mix side: whether an underrun now may deepen the target. Not right after a stall of
+    /// the whole machine (`clock::drift` knows): that audio is lost, not late, and a deeper
+    /// ring wouldn't have saved it.
+    pub fn hold_growth(&mut self, hold: bool) {
+        self.hold_growth = hold;
     }
 
     pub fn target(&self) -> usize {
@@ -296,6 +337,14 @@ impl RingReader {
             StreamStats::add(&stats.xrun_frames, out.len() - n);
             StreamStats::add(&stats.xruns, 1);
             self.primed = false;
+            if let Some(limit) = self.grow_limit
+                && self.target < limit
+                && !self.hold_growth
+            {
+                // Bursts deeper than the target: re-prime to a deeper one.
+                self.target = (self.target + crate::ms_to_frames(GROW_STEP_MS)).min(limit);
+                self.max = self.max.max(self.target + crate::ms_to_frames(TRIM_HEADROOM_MS));
+            }
         }
     }
 
@@ -386,6 +435,49 @@ mod tests {
         r.read(&mut out, &rs);
         assert_eq!(out, [[0.0; 2]; 8]);
         assert_eq!(rs.snapshot().xruns, 1);
+    }
+
+    #[test]
+    fn an_adaptive_reader_deepens_at_each_underrun_up_to_its_limit() {
+        let sizing = RingSizing::for_bursts(480, 512);
+        let (mut w, mut r) = sizing.input_ring();
+        let stats = StreamStats::default();
+        let step = crate::ms_to_frames(GROW_STEP_MS);
+        let limit = sizing.target + crate::ms_to_frames(GROW_LIMIT_MS);
+        let mut out = vec![[0.0; 2]; 256];
+        let mut targets = vec![r.target()];
+        for _ in 0..12 {
+            // Prime to the current target, then read past what's there: one underrun.
+            w.write(None, r.target() + 100, &stats);
+            r.read(&mut out, &stats);
+            while r.fill() >= out.len() {
+                r.read(&mut out, &stats);
+            }
+            r.read(&mut out, &stats);
+            targets.push(r.target());
+        }
+        assert_eq!(targets[1], sizing.target + step, "one step per underrun: {targets:?}");
+        assert_eq!(
+            *targets.last().unwrap(),
+            limit,
+            "and no further than the limit: {targets:?}"
+        );
+
+        // Held (the mix just stalled): an underrun doesn't deepen it.
+        let (mut w, mut r) = sizing.input_ring();
+        r.hold_growth(true);
+        w.write(None, sizing.target + 100, &stats);
+        for _ in 0..10 {
+            r.read(&mut out, &stats);
+        }
+        assert_eq!(r.target(), sizing.target);
+        // A fixed (output) ring never does.
+        let (mut w, mut r) = sizing.ring();
+        w.write(None, sizing.target + 100, &stats);
+        for _ in 0..10 {
+            r.read(&mut out, &stats);
+        }
+        assert_eq!(r.target(), sizing.target);
     }
 
     #[test]

@@ -302,6 +302,9 @@ pub struct Drift {
     /// on when it ends. A single reading would carry the burst sawtooth.
     settle_sum: f64,
     settle_n: u32,
+    /// The target moved (an input ring deepened after an underrun): hold and re-anchor like
+    /// after a stall, so the step to the new target eases in instead of kicking.
+    retargeted: bool,
 }
 
 impl Drift {
@@ -318,6 +321,20 @@ impl Drift {
             hold_until_ns: 0,
             settle_sum: 0.0,
             settle_n: 0,
+            retargeted: false,
+        }
+    }
+
+    /// Whether the mix stalled just now or is still settling from a stall (as of `now`).
+    pub fn settling(&self, now: u64) -> bool {
+        now < self.hold_until_ns || self.last_ns.is_some_and(|l| now.saturating_sub(l) > STALL_GAP_NS)
+    }
+
+    /// Steer toward a new fill from now on (the ring's reader moved its target).
+    pub fn retarget(&mut self, target: usize) {
+        if target != self.target {
+            self.target = target;
+            self.retargeted = true;
         }
     }
 
@@ -327,6 +344,11 @@ impl Drift {
 
     pub fn ppm(&self) -> f64 {
         self.pi.ppm()
+    }
+
+    /// The controller's low-passed fill, once it has one.
+    pub fn filtered_fill(&self) -> Option<f64> {
+        self.pi.filtered_fill()
     }
 
     pub fn target(&self) -> usize {
@@ -367,9 +389,13 @@ impl Drift {
     /// stall of the mix (a long gap since the previous call) the correction is held for a
     /// while instead of reacting to the catch-up.
     pub fn measure(&mut self, fill: usize, now: u64) {
-        if let Some(last) = self.last_ns.replace(now)
-            && now.saturating_sub(last) > STALL_GAP_NS
-        {
+        let stalled = self
+            .last_ns
+            .replace(now)
+            .is_some_and(|last| now.saturating_sub(last) > STALL_GAP_NS);
+        // A new target (the ring deepened after an underrun) is settled like a stall: hold,
+        // average the fill at its new level, re-anchor on that, never on one burst-y sample.
+        if stalled || std::mem::take(&mut self.retargeted) {
             self.hold_until_ns = now + STALL_HOLDOFF_NS;
             (self.settle_sum, self.settle_n) = (0.0, 0);
         }

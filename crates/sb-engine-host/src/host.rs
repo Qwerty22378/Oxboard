@@ -173,6 +173,10 @@ struct Host<E: Endpoints> {
     next_heartbeat: Instant,
     next_meters: Instant,
     next_xruns: Instant,
+    /// `SB_ENGINE_STATS=SECONDS`: print every ring's fill, drift correction and glitches to
+    /// stderr this often (diagnosing drift over long runs).
+    stats_every: Option<Duration>,
+    next_stats: Instant,
     /// Xrun counters as last reported, per (node, kind, which side of the ring).
     xrun_seen: HashMap<(NodeId, XrunKind, bool), u64>,
     fallback_reported: bool,
@@ -191,6 +195,12 @@ impl<E: Endpoints> Host<E> {
             next_heartbeat: now,
             next_meters: now,
             next_xruns: now,
+            stats_every: std::env::var("SB_ENGINE_STATS")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|s| *s > 0.0)
+                .map(Duration::from_secs_f64),
+            next_stats: now,
             xrun_seen: HashMap::new(),
             fallback_reported: false,
         }
@@ -284,6 +294,12 @@ impl<E: Endpoints> Host<E> {
                 self.next_xruns = next_due(self.next_xruns, self.cfg.xrun_every, now);
                 out.extend(Self::xruns(&r.engine, &mut self.xrun_seen));
             }
+            if let Some(every) = self.stats_every
+                && now >= self.next_stats
+            {
+                self.next_stats = next_due(self.next_stats, every, now);
+                Self::print_stats(&r.engine, self.started.elapsed());
+            }
         }
         if now >= self.next_heartbeat {
             self.next_heartbeat = next_due(self.next_heartbeat, self.cfg.heartbeat_every, now);
@@ -292,6 +308,35 @@ impl<E: Endpoints> Host<E> {
             });
         }
         (out, dead)
+    }
+
+    /// One line per ring side: who, fill, drift correction, glitches (`SB_ENGINE_STATS`).
+    fn print_stats(engine: &Engine<E>, uptime: Duration) {
+        let layout = engine.running_layout();
+        let mut line = format!("[engine {:>8.1}s]", uptime.as_secs_f64());
+        let mut side = |what: &str, node: NodeId, s: sb_engine::rt::stats::StatsSnapshot| {
+            line.push_str(&format!(
+                " | {what} n{}: fill {} measured {} filtered {:.0} ppm {:+.0} xruns {} trim {} max {}",
+                node.0,
+                s.ring_fill,
+                s.measured_fill,
+                s.filtered_fill,
+                s.drift_ppm,
+                s.xruns,
+                s.trimmed_frames,
+                s.max_chunk
+            ));
+        };
+        for ep in layout.inputs() {
+            side("in(mix)", ep.node, ep.stats.snapshot());
+        }
+        for ep in layout.outputs() {
+            side("out(mix)", ep.node, ep.stats.snapshot());
+        }
+        for (node, capture, s) in engine.endpoints().device_stats() {
+            side(if capture { "in(dev)" } else { "out(dev)" }, node, s);
+        }
+        eprintln!("{line}");
     }
 
     /// New glitches since the last scan, from both sides of every ring.

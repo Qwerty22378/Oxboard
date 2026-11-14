@@ -50,6 +50,7 @@ tools/vm/win-cargo.sh build --release -p sb-ui -p sb-controller -p sb-engine-hos
 tools/vm/win-cargo.sh test -p sb-ui --test widgets   # U3: the widgets under synthetic input; on the desktop, sb-ui.exe --gallery --show shows them all without a controller. tools/vm/desktop.sh starts programs there, clicks, drags and takes screenshots
 tools/vm/win-cargo.sh build --release -p sb-ui -p sb-controller -p sb-engine-host --bins --examples   # U4: Simple mode (Interface 1) + pads: sb-controller.exe --fake-devices --fake-driver, sb-ui.exe; pick "PC sound from", toggle output cards, "Clips into mic + me", add sounds (dialog or drop)
 tools/vm/win-cargo.sh test -p sb-controller --test windows_defaults   # M6: Windows' default output moved and back (IPolicyConfig); examples\default_output.exe [DEVICE] reads or sets it. sb-controller.exe runs sb-ui.exe, owns Ctrl+Shift+S and a tray icon (Quit = clean exit); with "PC sound from" a VB-Cable it makes CABLE Input the default while the engine runs
+STATS=5 LOAD=1 tools/vm/drift-run.sh 6   # drift: Interface 1 through VB-Cable for N minutes (LOAD=1: every core busy), each ring's fill, ppm and dropouts in target/vm/drift.log. SB_ENGINE_STATS=SECONDS makes any engine host print them; examples\capture_probe.exe NAME [--trace FILE] shows how a capture device really delivers
 ```
 
 Other commands: `vm.sh status | start | stop | ssh <role> [cmd] | view <role> | seal | revert | password`.
