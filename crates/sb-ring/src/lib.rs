@@ -4,7 +4,7 @@
 //! so the driver and user mode build the same layout from the same source.
 //!
 //! **The memory is untrusted on both sides.** It lives in user-mode pages that any process
-//! holding the stream interface could rewrite at any moment. So:
+//! holding the stream device could rewrite at any moment. So:
 //! - [`attach`] validates the header once and snapshots it; nothing in the header is read
 //!   again afterwards.
 //! - Each side keeps **its own index locally** and only *publishes* it; the other side's

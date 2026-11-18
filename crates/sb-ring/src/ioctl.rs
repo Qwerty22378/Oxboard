@@ -1,6 +1,17 @@
-//! Data-plane IOCTL ABI between the engine and the driver (`GUID_SB_STREAM`). Both sides use
+//! Data-plane IOCTL ABI between the engine and the driver (the stream device, [`STREAM_PATH`]). Both sides use
 //! these definitions; the driver must still treat every request as hostile (see the crate
 //! docs). Draft until D6 implements the driver side.
+
+/// The stream device's name: a WDF control device, like [`crate::control::CONTROL_DEVICE`].
+/// Only the engine host opens it, and only one handle at a time. It hands kernel-locked memory
+/// and kernel-signaled events to whoever holds it, so the driver's SDDL must stay tight.
+pub const STREAM_DEVICE: &str = "SoundboardStream";
+/// The kernel object name (`WdfDeviceInitAssignName`).
+pub const STREAM_NT_NAME: &str = r"\Device\SoundboardStream";
+/// The symbolic link the driver creates (`WdfDeviceCreateSymbolicLink`).
+pub const STREAM_LINK: &str = r"\DosDevices\SoundboardStream";
+/// What user mode passes to `CreateFileW`.
+pub const STREAM_PATH: &str = r"\\.\SoundboardStream";
 
 /// `FILE_DEVICE_SOUND`.
 const DEVICE_SOUND: u32 = 0x0000_001D;
@@ -65,8 +76,21 @@ const _: () = assert!(core::mem::size_of::<AttachBuffer>() == 24);
 const _: () = assert!(core::mem::size_of::<SetEvent>() == 16);
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// The three spellings of one device agree with its name.
+    pub(crate) fn assert_paths(name: &str, nt: &str, link: &str, path: &str) {
+        assert_eq!(nt.strip_prefix(r"\Device\"), Some(name));
+        assert_eq!(link.strip_prefix(r"\DosDevices\"), Some(name));
+        assert_eq!(path.strip_prefix(r"\\.\"), Some(name));
+    }
+
+    #[test]
+    fn stream_paths_name_the_same_device() {
+        assert_paths(STREAM_DEVICE, STREAM_NT_NAME, STREAM_LINK, STREAM_PATH);
+        assert_ne!(STREAM_DEVICE, crate::control::CONTROL_DEVICE);
+    }
 
     #[test]
     fn ctl_code_matches_the_windows_macro() {

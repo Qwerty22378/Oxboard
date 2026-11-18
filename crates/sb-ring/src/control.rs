@@ -1,13 +1,21 @@
-//! Control-plane IOCTL ABI between the controller and the driver (`GUID_SB_CONTROL`): the
-//! endpoint pool. The driver has a fixed pool; the controller enables, names and disables
+//! Control-plane IOCTL ABI between the controller and the driver (the control device,
+//! [`CONTROL_PATH`]): the endpoint pool. The driver has a fixed pool; the controller enables, names and disables
 //! endpoints, and picks what each does with no engine attached. Fixed-size `repr(C)` records,
 //! strings as NUL-terminated UTF-16 in fixed arrays. Draft until D7 implements the driver side,
 //! which must validate every field (see the crate docs).
 
 use crate::ioctl::sb;
 
-/// The control interface's device interface class (`GUID_SB_CONTROL`), as a u128 (no_std).
-pub const GUID_SB_CONTROL: u128 = 0xe2f9_3808_4ae8_45cb_9d4f_9a94_41a0_c228;
+/// The control device's name. The driver creates it as a WDF control device next to the ACX
+/// device (ACX owns the audio device's request dispatch), so it has no device interface: user
+/// mode opens it by path. Only the controller opens it, and only one handle at a time.
+pub const CONTROL_DEVICE: &str = "SoundboardControl";
+/// The kernel object name (`WdfDeviceInitAssignName`).
+pub const CONTROL_NT_NAME: &str = r"\Device\SoundboardControl";
+/// The symbolic link the driver creates (`WdfDeviceCreateSymbolicLink`).
+pub const CONTROL_LINK: &str = r"\DosDevices\SoundboardControl";
+/// What user mode passes to `CreateFileW`.
+pub const CONTROL_PATH: &str = r"\\.\SoundboardControl";
 
 /// Bumped on any incompatible change; `DriverInfo::abi_version` must match.
 pub const CONTROL_ABI: u32 = 1;
@@ -120,6 +128,11 @@ mod tests {
         }
         // CTL_CODE(FILE_DEVICE_SOUND, 0x801, METHOD_BUFFERED, FILE_READ_DATA|FILE_WRITE_DATA)
         assert_eq!(IOCTL_SB_GET_INFO, 0x001D_E004);
+    }
+
+    #[test]
+    fn control_paths_name_the_same_device() {
+        crate::ioctl::tests::assert_paths(CONTROL_DEVICE, CONTROL_NT_NAME, CONTROL_LINK, CONTROL_PATH);
     }
 
     #[test]

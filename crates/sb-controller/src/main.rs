@@ -215,7 +215,8 @@ fn engine_spawner(
 fn open_driver(fake: bool) -> Option<sb_controller::OpenDriver> {
     use sb_controller::driver::{FakeDriver, Transport};
     if fake {
-        return Some(Box::new(|| Ok(Box::new(FakeDriver::new(8, 2)) as Box<dyn Transport>)));
+        let fake = FakeDriver::new(8, 2);
+        return Some(Box::new(move || Ok(Box::new(fake.clone()) as Box<dyn Transport>)));
     }
     #[cfg(windows)]
     return Some(Box::new(|| {

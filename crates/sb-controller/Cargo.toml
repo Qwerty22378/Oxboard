@@ -19,7 +19,6 @@ windows-core.workspace = true
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true
 features = [
-    "Win32_Devices_DeviceAndDriverInstallation",  # CM_Get_Device_Interface_List: finding the driver
     "Win32_Devices_FunctionDiscovery",  # PKEY_Device_FriendlyName, PKEY_DeviceInterface_FriendlyName
     "Win32_Foundation",
     "Win32_Graphics_Gdi",               # the shell window's class (WNDCLASSW)

@@ -1,12 +1,21 @@
-//! The driver's control plane: the virtual endpoint pool, through `GUID_SB_CONTROL`.
+//! The driver's control plane: the virtual endpoint pool, through the driver's control device
+//! (`\\.\SoundboardControl`, see `sb_ring::control::CONTROL_PATH`).
 //!
 //! - [`ControlClient`] speaks the ABI in `sb_ring::control` over any [`Transport`].
 //! - [`FakeDriver`] is a transport that *is* a driver: it parses and validates requests the
 //!   way the kernel side must (D7), keeps a pool, and makes up Windows endpoint IDs. Tests and
 //!   `--fake-driver` use it, so the encoding is exercised before the driver exists.
-//! - `DeviceTransport` (Windows) finds the interface and calls `DeviceIoControl`.
+//! - `DeviceTransport` (Windows) opens the control device by path and calls `DeviceIoControl`.
 //! - [`spawn`] runs a client on a worker thread: IOCTLs can block, the actor never waits.
 //!   Each job reports the pool as it is afterwards (observations), then its result.
+//!
+//! The control device has no device interface, so nothing announces the driver arriving.
+//! The worker keeps **retrying the open** with backoff while the driver is missing, and while
+//! connected it **checks on the driver** every few seconds (`GET_INFO`). Any failed check means
+//! the driver is going away (it purges its queues on removal): the worker closes its handle at
+//! once, since the control device is exclusive and the old driver can't unload while we hold
+//! it, reports the pool gone, and goes back to retrying. A reinstalled driver starts with an
+//! empty pool, which routing re-enables.
 
 use crate::actor::{Inbox, Msg};
 use crate::state::{DriverStatus, Observation, PoolEndpoint};
@@ -14,8 +23,9 @@ use sb_ring::control::{self, DriverInfo, EndpointInfo, SetEndpoint, SetFallback,
 use sb_ring::ioctl::Direction;
 use sb_shared::ui::{DeviceKey, Flow};
 use std::collections::BTreeMap;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// One `DeviceIoControl`. Returns how many bytes of `output` were written.
 pub trait Transport: Send {
@@ -69,6 +79,17 @@ impl ControlClient {
             ));
         }
         Ok(Self { t, info })
+    }
+
+    /// Is the driver still there (and still the one we checked)?
+    pub fn ping(&mut self) -> Result<(), String> {
+        let mut out = [0u8; size_of::<DriverInfo>()];
+        let n = self.t.ioctl(control::IOCTL_SB_GET_INFO, &[], &mut out)?;
+        let info: DriverInfo = read(&out[..n]).ok_or("short GET_INFO reply")?;
+        if info != self.info {
+            return Err("the driver changed under us".into());
+        }
+        Ok(())
     }
 
     pub fn list(&mut self) -> Result<Vec<Endpoint>, String> {
@@ -142,6 +163,10 @@ struct FakePool {
     endpoints: BTreeMap<u32, EndpointInfo>,
     /// Fail every `SET_ENDPOINT` with this (tests).
     fail_set: Option<String>,
+    /// Removed (tests): every request fails, like a driver purging its queues on the way out.
+    removed: bool,
+    /// The pool as a freshly loaded driver has it.
+    fresh: BTreeMap<u32, EndpointInfo>,
 }
 
 impl FakeDriver {
@@ -166,10 +191,26 @@ impl FakeDriver {
         }
         Self {
             inner: Arc::new(Mutex::new(FakePool {
+                fresh: endpoints.clone(),
                 endpoints,
                 fail_set: None,
+                removed: false,
             })),
         }
+    }
+
+    /// Take the driver away (`true`): every request fails until it's back. Coming back is a
+    /// fresh load: the pool is as `new` made it (the real driver forgets everything).
+    pub fn set_removed(&self, removed: bool) {
+        let mut pool = self.lock();
+        if pool.removed && !removed {
+            pool.endpoints = pool.fresh.clone();
+        }
+        pool.removed = removed;
+    }
+
+    pub fn is_removed(&self) -> bool {
+        self.lock().removed
     }
 
     /// Make `SET_ENDPOINT` fail (or succeed again with `None`).
@@ -193,6 +234,9 @@ impl FakeDriver {
 impl Transport for FakeDriver {
     fn ioctl(&mut self, code: u32, input: &[u8], output: &mut [u8]) -> Result<usize, String> {
         let mut pool = self.lock();
+        if pool.removed {
+            return Err("the device has been removed".into());
+        }
         match code {
             control::IOCTL_SB_GET_INFO => {
                 let info = DriverInfo {
@@ -269,7 +313,7 @@ impl Transport for FakeDriver {
     }
 }
 
-/// The real driver: the first present `GUID_SB_CONTROL` interface.
+/// The real driver: its control device, opened by path (`sb_ring::control::CONTROL_PATH`).
 #[cfg(windows)]
 pub struct DeviceTransport {
     handle: windows::Win32::Foundation::HANDLE,
@@ -281,34 +325,17 @@ unsafe impl Send for DeviceTransport {}
 #[cfg(windows)]
 impl DeviceTransport {
     pub fn open() -> Result<Self, String> {
-        use windows::Win32::Devices::DeviceAndDriverInstallation::{
-            CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_Device_Interface_List_SizeW, CM_Get_Device_Interface_ListW,
-            CR_SUCCESS,
+        use windows::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE,
         };
-        use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
         use windows::Win32::Storage::FileSystem::{
             CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
         };
-        use windows::core::{GUID, PCWSTR};
-        let class = GUID::from_u128(control::GUID_SB_CONTROL);
-        let mut len = 0u32;
-        let cr =
-            unsafe { CM_Get_Device_Interface_List_SizeW(&mut len, &class, None, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) };
-        if cr != CR_SUCCESS || len <= 1 {
-            return Err("the soundboard driver isn't installed".into());
-        }
-        let mut list = vec![0u16; len as usize];
-        let cr =
-            unsafe { CM_Get_Device_Interface_ListW(&class, None, &mut list, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) };
-        if cr != CR_SUCCESS || list[0] == 0 {
-            return Err("the soundboard driver isn't installed".into());
-        }
-        let first = list.iter().position(|u| *u == 0).unwrap_or(list.len());
-        list.truncate(first);
-        list.push(0);
+        use windows::core::HSTRING;
+        let path = HSTRING::from(control::CONTROL_PATH);
         let handle = unsafe {
             CreateFileW(
-                PCWSTR(list.as_ptr()),
+                &path,
                 (GENERIC_READ | GENERIC_WRITE).0,
                 FILE_SHARE_NONE,
                 None,
@@ -317,7 +344,19 @@ impl DeviceTransport {
                 None,
             )
         }
-        .map_err(|e| format!("open the soundboard driver: {e}"))?;
+        .map_err(|e| {
+            let code = e.code();
+            if code == ERROR_FILE_NOT_FOUND.to_hresult() || code == ERROR_PATH_NOT_FOUND.to_hresult() {
+                "the soundboard driver isn't installed".to_string()
+            } else if code == ERROR_ACCESS_DENIED.to_hresult() {
+                // The driver's control device is exclusive and SDDL-protected.
+                "the soundboard driver refused the controller: another controller has it open, \
+                 or this account isn't allowed to"
+                    .to_string()
+            } else {
+                format!("open the soundboard driver: {e}")
+            }
+        })?;
         Ok(Self { handle })
     }
 }
@@ -375,75 +414,165 @@ impl From<&Endpoint> for PoolEndpoint {
     }
 }
 
-/// Run the driver worker: open with `open`, report the pool, then take jobs.
+/// How the worker waits for the driver.
+#[derive(Debug, Clone, Copy)]
+pub struct Timing {
+    /// First wait after a failed open; doubles up to `retry_max`.
+    pub retry_first: Duration,
+    pub retry_max: Duration,
+    /// How often a connected worker checks the driver is still there.
+    pub heartbeat: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            retry_first: Duration::from_millis(250),
+            retry_max: Duration::from_secs(5),
+            heartbeat: Duration::from_secs(2),
+        }
+    }
+}
+
+/// Run the driver worker: open with `open` (again and again while it fails), report the
+/// pool, then take jobs.
 pub fn spawn(
-    open: impl FnOnce() -> Result<Box<dyn Transport>, String> + Send + 'static,
+    open: impl FnMut() -> Result<Box<dyn Transport>, String> + Send + 'static,
+    inbox: Inbox,
+) -> (Sender<DriverJob>, std::thread::JoinHandle<()>) {
+    spawn_with(open, Timing::default(), inbox)
+}
+
+pub fn spawn_with(
+    mut open: impl FnMut() -> Result<Box<dyn Transport>, String> + Send + 'static,
+    timing: Timing,
     inbox: Inbox,
 ) -> (Sender<DriverJob>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("sb-driver".into())
         .spawn(move || {
-            let mut client = match open().and_then(ControlClient::open) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = inbox.send(Msg::Observed(Observation::Driver(DriverStatus::Missing(e.clone()))));
-                    for job in rx {
-                        match job {
-                            DriverJob::SetEndpoint { op, .. } => {
-                                let _ = inbox.send(Msg::DriverDone {
-                                    op,
-                                    result: Err(e.clone()),
-                                });
+            // What the actor was last told is wrong, so a retry that fails the same way is quiet.
+            let mut missing: Option<String> = None;
+            let mut wait = timing.retry_first;
+            loop {
+                match open().and_then(ControlClient::open) {
+                    Ok(client) => {
+                        wait = timing.retry_first;
+                        match connected(client, &rx, &inbox, timing.heartbeat) {
+                            Gone::Stopped => return,
+                            Gone::Lost(why) => {
+                                eprintln!("driver: {why}");
+                                missing = Some(why);
                             }
-                            DriverJob::Stop => break,
                         }
                     }
+                    Err(e) => {
+                        if missing.as_ref() != Some(&e) {
+                            let _ = inbox.send(Msg::Observed(Observation::Driver(DriverStatus::Missing(e.clone()))));
+                            missing = Some(e);
+                        }
+                    }
+                }
+                let why = missing.clone().unwrap_or_default();
+                if !refuse_until(Instant::now() + wait, &rx, &inbox, &why) {
                     return;
                 }
-            };
-            let mut known: BTreeMap<u32, Endpoint> = BTreeMap::new();
-            let mut report = |client: &mut ControlClient, first: bool| {
-                let mut out = Vec::new();
-                if first {
-                    out.push(Observation::Driver(DriverStatus::Ready));
-                }
-                match client.list() {
-                    Ok(list) => {
-                        let now: BTreeMap<u32, Endpoint> = list.into_iter().map(|e| (e.id, e)).collect();
-                        for id in known.keys().filter(|id| !now.contains_key(id)) {
-                            out.push(Observation::Endpoint { id: *id, state: None });
-                        }
-                        for (id, e) in &now {
-                            if known.get(id) != Some(e) {
-                                out.push(Observation::Endpoint {
-                                    id: *id,
-                                    state: Some(e.into()),
-                                });
-                            }
-                        }
-                        known = now;
-                    }
-                    Err(e) => eprintln!("driver: listing endpoints: {e}"),
-                }
-                if !out.is_empty() {
-                    let _ = inbox.send(Msg::ObservedAll(out));
-                }
-            };
-            report(&mut client, true);
-            for job in rx {
-                match job {
-                    DriverJob::SetEndpoint { op, id, enabled, name } => {
-                        let result = client.set_endpoint(id, enabled, &name);
-                        report(&mut client, false);
-                        let _ = inbox.send(Msg::DriverDone { op, result });
-                    }
-                    DriverJob::Stop => break,
-                }
+                wait = (wait * 2).min(timing.retry_max);
             }
         })
         .expect("spawn the driver worker");
     (tx, thread)
+}
+
+enum Gone {
+    Stopped,
+    /// The driver went away; its pool has been reported gone, and the actor told this.
+    Lost(String),
+}
+
+/// No driver until `deadline`: jobs fail with `why`. `false` once told to stop.
+fn refuse_until(deadline: Instant, rx: &Receiver<DriverJob>, inbox: &Inbox, why: &str) -> bool {
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(DriverJob::SetEndpoint { op, .. }) => {
+                let _ = inbox.send(Msg::DriverDone {
+                    op,
+                    result: Err(why.to_owned()),
+                });
+            }
+            Ok(DriverJob::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
+            Err(RecvTimeoutError::Timeout) => return true,
+        }
+    }
+}
+
+/// Serve jobs over an open driver until it goes away or the worker is stopped.
+fn connected(mut client: ControlClient, rx: &Receiver<DriverJob>, inbox: &Inbox, heartbeat: Duration) -> Gone {
+    let mut known: BTreeMap<u32, Endpoint> = BTreeMap::new();
+    let mut report = |client: &mut ControlClient, first: bool| {
+        let mut out = Vec::new();
+        if first {
+            out.push(Observation::Driver(DriverStatus::Ready));
+        }
+        match client.list() {
+            Ok(list) => {
+                let now: BTreeMap<u32, Endpoint> = list.into_iter().map(|e| (e.id, e)).collect();
+                for id in known.keys().filter(|id| !now.contains_key(id)) {
+                    out.push(Observation::Endpoint { id: *id, state: None });
+                }
+                for (id, e) in &now {
+                    if known.get(id) != Some(e) {
+                        out.push(Observation::Endpoint {
+                            id: *id,
+                            state: Some(e.into()),
+                        });
+                    }
+                }
+                known = now;
+            }
+            Err(e) => eprintln!("driver: listing endpoints: {e}"),
+        }
+        if !out.is_empty() {
+            let _ = inbox.send(Msg::ObservedAll(out));
+        }
+    };
+    report(&mut client, true);
+    let mut next_check = Instant::now() + heartbeat;
+    let lost = loop {
+        match rx.recv_timeout(next_check.saturating_duration_since(Instant::now())) {
+            Ok(DriverJob::SetEndpoint { op, id, enabled, name }) => {
+                let result = client.set_endpoint(id, enabled, &name);
+                // A failure may be the driver leaving rather than a refusal: check before
+                // reporting the pool.
+                let gone = result.as_ref().err().and_then(|_| client.ping().err());
+                if gone.is_none() {
+                    report(&mut client, false);
+                }
+                let _ = inbox.send(Msg::DriverDone { op, result });
+                if let Some(why) = gone {
+                    break why;
+                }
+            }
+            Ok(DriverJob::Stop) | Err(RecvTimeoutError::Disconnected) => return Gone::Stopped,
+            Err(RecvTimeoutError::Timeout) => {
+                if let Err(why) = client.ping() {
+                    break why;
+                }
+                next_check = Instant::now() + heartbeat;
+            }
+        }
+    };
+    // Close the handle before anything else: the old driver can't unload while we hold it.
+    drop(client);
+    let why = format!("the soundboard driver went away ({lost})");
+    let mut out: Vec<Observation> = known
+        .keys()
+        .map(|id| Observation::Endpoint { id: *id, state: None })
+        .collect();
+    out.push(Observation::Driver(DriverStatus::Missing(why.clone())));
+    let _ = inbox.send(Msg::ObservedAll(out));
+    Gone::Lost(why)
 }
 
 #[cfg(test)]
@@ -514,6 +643,211 @@ mod tests {
             d.ioctl(control::IOCTL_SB_LIST_ENDPOINTS, &[], &mut one).unwrap(),
             size_of::<EndpointInfo>()
         );
+    }
+
+    const FAST: Timing = Timing {
+        retry_first: Duration::from_millis(5),
+        retry_max: Duration::from_millis(20),
+        heartbeat: Duration::from_millis(20),
+    };
+
+    /// The next message the worker sends, within a second.
+    fn next(rx: &Receiver<Msg>) -> Msg {
+        rx.recv_timeout(Duration::from_secs(1)).expect("a message from the driver worker")
+    }
+
+    /// Messages until one matches; panics after a second.
+    fn until(rx: &Receiver<Msg>, mut want: impl FnMut(&Msg) -> bool) -> Vec<Msg> {
+        let mut seen = Vec::new();
+        loop {
+            let m = next(rx);
+            let done = want(&m);
+            seen.push(m);
+            if done {
+                return seen;
+            }
+        }
+    }
+
+    fn says_ready(m: &Msg) -> bool {
+        matches!(m, Msg::ObservedAll(all) if all.first() == Some(&Observation::Driver(DriverStatus::Ready)))
+    }
+
+    fn says_missing(m: &Msg) -> Option<&str> {
+        fn missing(o: &Observation) -> Option<&str> {
+            match o {
+                Observation::Driver(DriverStatus::Missing(why)) => Some(why.as_str()),
+                _ => None,
+            }
+        }
+        match m {
+            Msg::Observed(o) => missing(o),
+            Msg::ObservedAll(all) => all.iter().find_map(missing),
+            _ => None,
+        }
+    }
+
+    /// A handle on a fake driver that counts itself, so tests see when the worker closes it.
+    struct Handle {
+        d: FakeDriver,
+        open: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Transport for Handle {
+        fn ioctl(&mut self, code: u32, input: &[u8], output: &mut [u8]) -> Result<usize, String> {
+            self.d.ioctl(code, input, output)
+        }
+    }
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            self.open.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Opens `d` like `DeviceTransport` would: fails while it's removed.
+    fn opener(
+        d: &FakeDriver,
+        open: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnMut() -> Result<Box<dyn Transport>, String> + Send + 'static {
+        let (d, open) = (d.clone(), open.clone());
+        move || {
+            if d.is_removed() {
+                return Err("the soundboard driver isn't installed".into());
+            }
+            open.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(Handle {
+                d: d.clone(),
+                open: open.clone(),
+            }))
+        }
+    }
+
+    fn set(op: u64, id: u32, enabled: bool) -> DriverJob {
+        DriverJob::SetEndpoint {
+            op,
+            id,
+            enabled,
+            name: "Discord".into(),
+        }
+    }
+
+    fn done(m: &Msg, want: u64) -> bool {
+        matches!(m, Msg::DriverDone { op, .. } if *op == want)
+    }
+
+    #[test]
+    fn a_driver_installed_later_is_found() {
+        let d = FakeDriver::new(2, 0);
+        d.set_removed(true);
+        let open = Arc::default();
+        let (inbox, rx) = mpsc::channel();
+        let (jobs, thread) = spawn_with(opener(&d, &open), FAST, inbox);
+
+        assert_eq!(says_missing(&next(&rx)), Some("the soundboard driver isn't installed"));
+        // Meanwhile jobs fail at once, with why.
+        jobs.send(set(1, 1, true)).unwrap();
+        let Msg::DriverDone { op: 1, result: Err(why) } = next(&rx) else { panic!() };
+        assert!(why.contains("isn't installed"));
+        // Several retries fail the same way: the actor isn't told again.
+        std::thread::sleep(FAST.retry_max * 3);
+        assert!(rx.try_recv().is_err(), "the same failure is reported once");
+
+        d.set_removed(false);
+        let seen = until(&rx, says_ready);
+        assert!(seen.iter().all(|m| says_missing(m).is_none()));
+        jobs.send(set(2, 1, true)).unwrap();
+        let seen = until(&rx, |m| done(m, 2));
+        assert!(matches!(seen.last(), Some(Msg::DriverDone { result: Ok(()), .. })));
+
+        jobs.send(DriverJob::Stop).unwrap();
+        thread.join().unwrap();
+        assert_eq!(open.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_driver_that_goes_away_is_let_go_and_found_again() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let d = FakeDriver::new(2, 1);
+        let open = Arc::default();
+        let (inbox, rx) = mpsc::channel();
+        let (jobs, thread) = spawn_with(opener(&d, &open), FAST, inbox);
+        until(&rx, says_ready);
+        jobs.send(set(1, 2, true)).unwrap();
+        until(&rx, |m| done(m, 1));
+
+        // The driver is being removed (an update): the heartbeat notices, and the handle is
+        // closed before the actor hears, so the old driver can unload.
+        d.set_removed(true);
+        let seen = until(&rx, |m| says_missing(m).is_some());
+        assert_eq!(open.load(SeqCst), 0, "the handle is closed");
+        let Some(Msg::ObservedAll(all)) = seen.last() else { panic!() };
+        for id in 1..=3 {
+            assert!(all.contains(&Observation::Endpoint { id, state: None }), "endpoint {id} gone");
+        }
+        assert!(says_missing(seen.last().unwrap()).unwrap().contains("went away"));
+        // Then it's simply not installed, until the new one is.
+        assert_eq!(says_missing(&next(&rx)), Some("the soundboard driver isn't installed"));
+
+        d.set_removed(false);
+        let seen = until(&rx, says_ready);
+        let Some(Msg::ObservedAll(all)) = seen.last() else { panic!() };
+        // A fresh driver: every endpoint reported again, all disabled (routing re-enables).
+        let endpoints: Vec<_> = all
+            .iter()
+            .filter_map(|o| match o {
+                Observation::Endpoint { id, state: Some(e) } => Some((*id, e.enabled)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(endpoints, [(1, false), (2, false), (3, false)]);
+        assert_eq!(open.load(SeqCst), 1);
+
+        jobs.send(DriverJob::Stop).unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_refused_job_keeps_the_driver() {
+        let d = FakeDriver::new(2, 0);
+        let open = Arc::default();
+        let (inbox, rx) = mpsc::channel();
+        let (jobs, thread) = spawn_with(opener(&d, &open), FAST, inbox);
+        until(&rx, says_ready);
+        d.fail_set_endpoint(Some("busy"));
+        jobs.send(set(1, 1, true)).unwrap();
+        let seen = until(&rx, |m| done(m, 1));
+        assert!(matches!(seen.last(), Some(Msg::DriverDone { result: Err(why), .. }) if why == "busy"));
+        // Still connected through a few heartbeats.
+        std::thread::sleep(FAST.heartbeat * 4);
+        while let Ok(m) = rx.try_recv() {
+            assert!(says_missing(&m).is_none(), "{m:?}");
+        }
+        d.fail_set_endpoint(None);
+        jobs.send(set(2, 1, true)).unwrap();
+        let seen = until(&rx, |m| done(m, 2));
+        assert!(matches!(seen.last(), Some(Msg::DriverDone { result: Ok(()), .. })));
+        jobs.send(DriverJob::Stop).unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_job_that_finds_the_driver_gone_fails_and_lets_go() {
+        let d = FakeDriver::new(2, 0);
+        let open = Arc::default();
+        let (inbox, rx) = mpsc::channel();
+        // A heartbeat too slow to notice first: the job does.
+        let slow = Timing {
+            heartbeat: Duration::from_secs(60),
+            ..FAST
+        };
+        let (jobs, thread) = spawn_with(opener(&d, &open), slow, inbox);
+        until(&rx, says_ready);
+        d.set_removed(true);
+        jobs.send(set(1, 1, true)).unwrap();
+        let seen = until(&rx, |m| says_missing(m).is_some());
+        assert!(seen.iter().any(|m| matches!(m, Msg::DriverDone { op: 1, result: Err(_) })));
+        assert_eq!(open.load(std::sync::atomic::Ordering::SeqCst), 0);
+        jobs.send(DriverJob::Stop).unwrap();
+        thread.join().unwrap();
     }
 
     #[test]

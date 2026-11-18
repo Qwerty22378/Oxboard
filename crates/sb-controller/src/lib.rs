@@ -87,8 +87,9 @@ impl Stopped {
     }
 }
 
-/// Opens the driver's control interface (on the driver worker's thread).
-pub type OpenDriver = Box<dyn FnOnce() -> Result<Box<dyn driver::Transport>, String> + Send>;
+/// Opens the driver's control device (on the driver worker's thread). Called again after each
+/// failure, and after the driver goes away, until it succeeds.
+pub type OpenDriver = Box<dyn FnMut() -> Result<Box<dyn driver::Transport>, String> + Send>;
 
 /// What a controller runs besides the actor and the UI server.
 #[derive(Default)]
